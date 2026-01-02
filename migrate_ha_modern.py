@@ -17,7 +17,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from rich import box
 import questionary
 
-# ================= KONFIGURATION & DEFINITIONEN =================
+# ================= KONFIGURATION =================
 DEFAULT_CONFIG = {
     "sqlite_path": "home-assistant_v2.db",
     "pg_host": "localhost",
@@ -100,6 +100,28 @@ def update_sequence_if_needed(p_cur, table_name, pk_col, max_src_id, buffer_size
         return False, curr_seq, target
     except: return False, 0, 0
 
+def get_blocking_constraints(p_cur, table_name):
+    """Ermittelt Indizes, die Duplikate verhindern (Arbiters)."""
+    try:
+        p_cur.execute("""
+            SELECT indexname 
+            FROM pg_indexes 
+            WHERE schemaname = 'public' 
+            AND tablename = %s 
+            AND indexdef LIKE '%UNIQUE%'
+        """, (table_name,))
+        return [row[0] for row in p_cur.fetchall()]
+    except: return []
+
+def format_bytes(size):
+    power = 2**10
+    n = 0
+    power_labels = {0 : '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
+    while size > power:
+        size /= power
+        n += 1
+    return f"{size:.2f} {power_labels[n]}B"
+
 # ================= DB MANAGER =================
 
 class PostgresManager:
@@ -167,41 +189,42 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
     table_name = tbl_conf['name']
     pk_col = tbl_conf.get('pk')
     
-    # SQLite Columns
     s_cur = s_conn.cursor()
     try:
         s_cur.execute(f"PRAGMA table_info({table_name})")
         s_cols = [r['name'] for r in s_cur.fetchall()]
-    except: 
-        return False
+    except: return {"status": False, "msg": "Source missing"}
     finally: s_cur.close()
 
-    # Postgres Columns
     with p_conn.cursor() as p_cur:
         p_cur.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_schema='public' AND table_name=%s", (table_name,))
         col_types = {row[0]: row[1] for row in p_cur.fetchall()}
-        p_cur.execute("SELECT kcu.column_name FROM information_schema.key_column_usage kcu JOIN information_schema.table_constraints tco ON kcu.constraint_name = tco.constraint_name WHERE tco.constraint_type = 'PRIMARY KEY' AND tco.table_name = %s", (table_name,))
-        pk_cols = [r[0] for r in p_cur.fetchall()]
 
     common_cols = [c for c in s_cols if c in col_types]
-    if not common_cols: return False
+    if not common_cols: return {"status": False, "msg": "No common columns"}
+
+    # --- UPDATED: Constraint Info ---
+    with p_conn.cursor() as check_cur:
+        constraints = get_blocking_constraints(check_cur, table_name)
+    
+    if constraints:
+        # Neutrale Info statt Warnung
+        console.print(f"   [dim]ℹ Duplikat-Filter für {table_name}: {', '.join(constraints)}[/dim]")
 
     bool_cols = {c for c in common_cols if col_types[c] == 'boolean'}
     time_cols = {c for c in common_cols if any(x in c for x in TIME_COL_KEYWORDS)}
 
     quoted_cols = [f'"{c}"' for c in common_cols]
     placeholders = ["%s"] * len(common_cols)
-    conflict_sql = f"ON CONFLICT ({', '.join([f'\"{c}\"' for c in pk_cols])}) DO NOTHING" if pk_cols else ""
+    conflict_sql = "ON CONFLICT DO NOTHING"
     insert_sql = f"INSERT INTO public.{table_name} ({', '.join(quoted_cols)}) VALUES ({', '.join(placeholders)}) {conflict_sql}"
 
     start_id = progress_map.get(table_name, 0)
     s_cur = s_conn.cursor()
     max_src_id = get_max_id(s_cur, table_name, pk_col) if pk_col else 0
     
-    # Init Total
-    total_rows = 0
     rich_progress.update(task_id, description=f"[cyan]Zähle {table_name}...", total=None)
-    
+    total_rows = 0
     if pk_col:
         if start_id < max_src_id:
             s_cur.execute(f"SELECT COUNT(*) FROM {table_name} WHERE {pk_col} > ?", (start_id,))
@@ -213,14 +236,15 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
     if total_rows == 0:
         rich_progress.update(task_id, description=f"[green]{table_name} (Aktuell)", completed=100, total=100)
         s_cur.close()
-        return True
+        return {"status": True, "inserted": 0, "skipped": 0}
 
     rich_progress.update(task_id, description=f"[bold cyan]{table_name}", total=total_rows, completed=0)
 
     p_cur = p_conn.cursor()
     curr_off = start_id
     batch_size = cfg["batch_size"]
-    success = True
+    stats_inserted = 0
+    stats_skipped = 0
     
     try:
         while True:
@@ -248,6 +272,16 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
                 if pk_col: last_id = row[pk_col]
 
             psycopg2.extras.execute_batch(p_cur, insert_sql, batch_data, page_size=batch_size)
+            
+            batch_inserted = p_cur.rowcount
+            if batch_inserted < 0: batch_inserted = 0
+            
+            skipped_in_batch = len(batch_data) - batch_inserted
+            stats_inserted += batch_inserted
+            stats_skipped += skipped_in_batch
+            
+            rich_progress.update(task_id, description=f"[bold cyan]{table_name}[/] [dim](+{stats_inserted} | Skip: {stats_skipped})[/]")
+
             p_conn.commit()
             if pk_col: save_progress(table_name, last_id)
             
@@ -259,14 +293,13 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
             update_sequence_if_needed(p_cur, table_name, pk_col, max_src_id, cfg['seq_buffer'])
             p_conn.commit()
 
+        return {"status": True, "inserted": stats_inserted, "skipped": stats_skipped}
+
     except Exception as e:
         p_conn.rollback()
-        console.print(f"[bold red]Fehler in {table_name}:[/bold red] {e}")
-        success = False
+        return {"status": False, "msg": str(e)}
     finally:
         p_cur.close(); s_cur.close()
-
-    return success
 
 # ================= ACTIONS =================
 
@@ -334,7 +367,6 @@ def action_convert_schema(config):
 
     if not targets: return
 
-    # States Warnung
     if any(t['name'] == 'states' for t in targets):
         console.print("[bold yellow]WARNUNG:[/bold yellow] Tabelle 'states' gewählt.")
         console.print("Dies löscht Foreign Keys (old_state_id). Dies ist für TimescaleDB notwendig.")
@@ -354,7 +386,6 @@ def action_convert_schema(config):
                 name = tbl['name']
                 progress.update(task, description=f"Konvertiere {name}...")
                 try:
-                    # Logic
                     if "drop_fk" in tbl:
                         for fk in tbl["drop_fk"]:
                             try: c.execute(f"ALTER TABLE {name} DROP CONSTRAINT IF EXISTS {fk};")
@@ -387,10 +418,11 @@ def run_migration_plan(config, plan):
     s_conn = connect_sqlite_ro(config["sqlite_path"])
     if not s_conn: return
 
+    report_data = []
+
     with PostgresManager(config, fast_mode=True) as p_conn:
         progress_data = load_json(PROGRESS_FILE)
         
-        # Schönes Progress Layout
         rich_progress = Progress(
             SpinnerColumn(),
             TextColumn("[bold blue]{task.description}"),
@@ -405,13 +437,32 @@ def run_migration_plan(config, plan):
             for t_name in plan:
                 task_id = rich_progress.add_task(f"Warte auf {t_name}...", start=False)
                 rich_progress.start_task(task_id)
-                success = migrate_single_table(s_conn, p_conn, TABLE_MAP[t_name], config, progress_data, rich_progress, task_id)
-                if not success:
-                    console.print(f"[bold red]Abbruch bei {t_name}[/bold red]")
+                result = migrate_single_table(s_conn, p_conn, TABLE_MAP[t_name], config, progress_data, rich_progress, task_id)
+                
+                if result["status"]:
+                    report_data.append({"name": t_name, "status": "OK", "ins": result["inserted"], "skip": result["skipped"]})
+                else:
+                    report_data.append({"name": t_name, "status": "FAIL", "msg": result["msg"]})
+                    console.print(f"[bold red]Abbruch bei {t_name}: {result['msg']}[/bold red]")
                     break
 
     s_conn.close()
     
+    console.print("")
+    rpt = Table(title="Migration Report", box=box.SIMPLE)
+    rpt.add_column("Tabelle", style="cyan")
+    rpt.add_column("Status", style="bold")
+    rpt.add_column("Neu", style="green", justify="right")
+    rpt.add_column("Duplikate (Skip)", style="yellow", justify="right")
+    
+    for item in report_data:
+        if item["status"] == "OK":
+            rpt.add_row(item["name"], "[green]OK[/]", str(item["ins"]), str(item["skip"]))
+        else:
+            rpt.add_row(item["name"], "[red]FAIL[/]", "-", "-")
+    
+    console.print(rpt)
+
     if any("statistics" in t for t in plan) and config["timescale_enabled"]:
         if questionary.confirm("TimescaleDB Optimierung jetzt starten?").ask():
             action_convert_schema(config)
@@ -440,7 +491,6 @@ def action_migration_menu(config):
         
         if not target_plan: return
 
-        # Dependency Check
         selected_set = set(target_plan)
         missing = set()
         for t in target_plan:
@@ -461,20 +511,10 @@ def action_migration_menu(config):
             
             if opt == "Abbruch": return
             if opt.startswith("Fehlende"):
-                 # Topologische Sortierung bewahren via TABLES_CONF
                  combined = selected_set | missing
                  target_plan = [t['name'] for t in TABLES_CONF if t['name'] in combined]
 
     run_migration_plan(config, target_plan)
-
-def format_bytes(size):
-    power = 2**10
-    n = 0
-    power_labels = {0 : '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
-    while size > power:
-        size /= power
-        n += 1
-    return f"{size:.2f} {power_labels[n]}B"
 
 def action_show_stats(config):
     console.print(Panel("[bold]Datenbank Vergleich[/bold]", box=box.ROUNDED))
@@ -487,7 +527,6 @@ def action_show_stats(config):
             p_cur = p_conn.cursor()
             s_cur = s_conn.cursor()
             
-            # DB Size
             try:
                 s_size = os.path.getsize(config["sqlite_path"])
                 p_cur.execute("SELECT pg_database_size(current_database());")
@@ -502,18 +541,14 @@ def action_show_stats(config):
 
             for tbl in TABLES_CONF:
                 name = tbl['name']
-                # SQLite Count
                 try:
                     s_cur.execute(f"SELECT COUNT(*) FROM {name}")
                     s_c = f"{s_cur.fetchone()[0]:,}"
                 except: s_c = "n/a"
                 
-                # PG Count
                 try:
                     p_cur.execute(f"SELECT COUNT(*) FROM {name}")
                     p_c = f"{p_cur.fetchone()[0]:,}"
-                    
-                    # TS check
                     p_cur.execute("SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name=%s", (name,))
                     ts = "✅" if p_cur.fetchone() else "-"
                 except: 
@@ -561,7 +596,6 @@ def main():
     console.clear()
     console.print(Panel.fit("[bold blue]Home Assistant Migration Tool[/bold blue]\n[dim]Next-Gen Edition[/dim]", box=box.DOUBLE))
 
-    # Konfiguration laden
     if not os.path.exists(CONFIG_FILE):
         if questionary.confirm("Keine Konfiguration gefunden. Jetzt erstellen?").ask():
             action_create_config()
