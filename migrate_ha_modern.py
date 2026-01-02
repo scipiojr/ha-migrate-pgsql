@@ -57,7 +57,6 @@ DEPENDENCIES = {
 }
 
 TABLE_MAP = {t["name"]: t for t in TABLES_CONF}
-TIME_COL_KEYWORDS = ["time", "last_", "created", "start", "end", "changed"]
 
 # ================= UTILS =================
 
@@ -101,7 +100,6 @@ def update_sequence_if_needed(p_cur, table_name, pk_col, max_src_id, buffer_size
     except: return False, 0, 0
 
 def get_blocking_constraints(p_cur, table_name):
-    """Ermittelt Indizes, die Duplikate verhindern (Arbiters)."""
     try:
         p_cur.execute("""
             SELECT indexname 
@@ -167,11 +165,31 @@ def connect_sqlite_ro(path):
     conn.row_factory = sqlite3.Row
     return conn
 
-# ================= MIGRATION LOGIC =================
+# ================= CORE: TYPE CONVERTER =================
 
-def process_value(val, is_bool, is_time):
+def process_value(val, target_type):
+    """
+    Intelligente Typ-Konvertierung basierend auf der Ziel-Spalte in Postgres.
+    """
     if val is None: return None
-    if is_time:
+    
+    tt = target_type.lower()
+
+    # 1. JSON & JSONB (Wichtig für attribute)
+    if 'json' in tt:
+        # SQLite liefert Strings. Postgres psycopg2 kommt damit meist klar.
+        # Wir müssen nur verhindern, dass es versehentlich als Datum geparst wird.
+        return val
+
+    # 2. Boolean (SQLite 0/1 -> Postgres True/False)
+    if 'boolean' in tt:
+        if isinstance(val, int): return bool(val)
+        if isinstance(val, str): 
+            return val.lower() in ('true', '1', 't', 'y', 'yes')
+        return val
+
+    # 3. Zeitstempel (Nur wenn Ziel wirklich Zeit ist)
+    if 'timestamp' in tt or 'date' in tt:
         if isinstance(val, (int, float)):
             try: return datetime.fromtimestamp(val, tz=timezone.utc)
             except: return None
@@ -181,14 +199,29 @@ def process_value(val, is_bool, is_time):
                 if dt.tzinfo is None: return dt.replace(tzinfo=timezone.utc)
                 return dt.astimezone(timezone.utc)
             except: return None
-    if is_bool: return True if val == 1 else (False if val == 0 else val)
-    if isinstance(val, str) and '\0' in val: return val.replace('\0', '')
+            
+    # 4. Ganzzahlen (SQLite liefert oft 5.0, Postgres will 5)
+    if 'int' in tt or 'serial' in tt:
+        if isinstance(val, float): return int(val)
+        if isinstance(val, str):
+            try: return int(float(val)) # "5.0" -> 5.0 -> 5
+            except: return None
+        return val
+
+    # 5. Strings (Text cleanup)
+    if 'char' in tt or 'text' in tt:
+        s_val = str(val)
+        if '\0' in s_val: return s_val.replace('\0', '')
+        return s_val
+        
+    # Fallback: Einfach durchreichen (für Double, Float etc.)
     return val
 
 def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progress, task_id):
     table_name = tbl_conf['name']
     pk_col = tbl_conf.get('pk')
     
+    # 1. Source Check
     s_cur = s_conn.cursor()
     try:
         s_cur.execute(f"PRAGMA table_info({table_name})")
@@ -196,6 +229,7 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
     except: return {"status": False, "msg": "Source missing"}
     finally: s_cur.close()
 
+    # 2. Target Check & Type Mapping
     with p_conn.cursor() as p_cur:
         p_cur.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_schema='public' AND table_name=%s", (table_name,))
         col_types = {row[0]: row[1] for row in p_cur.fetchall()}
@@ -203,22 +237,18 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
     common_cols = [c for c in s_cols if c in col_types]
     if not common_cols: return {"status": False, "msg": "No common columns"}
 
-    # --- UPDATED: Constraint Info ---
+    # 3. Constraints
     with p_conn.cursor() as check_cur:
         constraints = get_blocking_constraints(check_cur, table_name)
-    
     if constraints:
-        # Neutrale Info statt Warnung
         console.print(f"   [dim]ℹ Duplikat-Filter für {table_name}: {', '.join(constraints)}[/dim]")
-
-    bool_cols = {c for c in common_cols if col_types[c] == 'boolean'}
-    time_cols = {c for c in common_cols if any(x in c for x in TIME_COL_KEYWORDS)}
 
     quoted_cols = [f'"{c}"' for c in common_cols]
     placeholders = ["%s"] * len(common_cols)
     conflict_sql = "ON CONFLICT DO NOTHING"
     insert_sql = f"INSERT INTO public.{table_name} ({', '.join(quoted_cols)}) VALUES ({', '.join(placeholders)}) {conflict_sql}"
 
+    # Zählen
     start_id = progress_map.get(table_name, 0)
     s_cur = s_conn.cursor()
     max_src_id = get_max_id(s_cur, table_name, pk_col) if pk_col else 0
@@ -258,15 +288,14 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
 
             batch_data = []
             last_id = curr_off
+            
             for row in rows:
                 clean_row = []
                 for c in common_cols:
                     val = row[c]
+                    # HIER: Strikte Typ-Konvertierung basierend auf ZIEL-Typ
                     if val is not None:
-                        is_b = c in bool_cols
-                        is_t = c in time_cols
-                        if is_b or is_t or (isinstance(val, str) and '\0' in val):
-                            val = process_value(val, is_b, is_t)
+                        val = process_value(val, col_types[c])
                     clean_row.append(val)
                 batch_data.append(clean_row)
                 if pk_col: last_id = row[pk_col]
