@@ -64,5 +64,5 @@ Run: `python migrate_ha_modern.py`
 1. **Setup:** Menu **[0] Create Config.**
 2. **Pre-Flight:** Menu **[3] Maintenance -> Sequence Reset**.
 3. **Switch HA:** Configure HA to use Postgres and restart.
-4. ** Migrate:** Menu **[1] Migration -> All Tables**.
+4. **Migrate:** Menu **[1] Migration -> All Tables**.
 5. **Optimize:** Menu **[2] TimescaleDB (Optional)**.
