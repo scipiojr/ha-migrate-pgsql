@@ -1,6 +1,7 @@
 import sqlite3
 import psycopg2
 import psycopg2.extras
+from psycopg2.extras import execute_values
 from dateutil import parser as date_parser
 from datetime import datetime, timezone
 import sys
@@ -16,7 +17,6 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
 from rich import box
 import questionary
-from questionary import Choice, Style
 
 # ================= KONFIGURATION =================
 DEFAULT_CONFIG = {
@@ -259,7 +259,7 @@ def get_db_resume_point(p_cur, table_name, pk_col, max_src_id):
     except:
         return 0
 
-# ================= CORE LOGIC: OPTIMIZED CONVERTERS =================
+# ================= CORE LOGIC: CONVERTERS =================
 
 def _conv_noop(val):
     return val
@@ -399,7 +399,11 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
     quoted_cols = [f'"{c}"' for c in common_cols]
     placeholders = ["%s"] * len(common_cols)
     conflict_sql = "ON CONFLICT DO NOTHING"
-    insert_sql = f"INSERT INTO public.{table_name} ({', '.join(quoted_cols)}) VALUES ({', '.join(placeholders)}) {conflict_sql}"
+    insert_sql = f"INSERT INTO public.{table_name} ({', '.join(quoted_cols)}) VALUES %s {conflict_sql}"
+    
+    # Optional RETURNING für Skip-Analyse
+    if pk_col:
+        insert_sql += f" RETURNING {pk_col}"
 
     saved_start_id = progress_map.get(table_name, 0)
     s_cur = s_conn.cursor()
@@ -446,6 +450,11 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
     stats_inserted = 0
     stats_skipped = 0
     
+    pk_idx = -1
+    if pk_col:
+        try: pk_idx = common_cols.index(pk_col)
+        except: pk_idx = -1
+
     try:
         while True:
             if pk_col:
@@ -458,6 +467,7 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
                 break
 
             batch_data = []
+            batch_ids = []
             last_id = curr_off
             
             for row in rows:
@@ -467,20 +477,44 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
                         val = converters[i](val)
                     clean_row.append(val)
                 batch_data.append(clean_row)
+                
                 if pk_col:
                     last_id = row[pk_col]
+                    if pk_idx >= 0:
+                        batch_ids.append(clean_row[pk_idx])
 
-            psycopg2.extras.execute_batch(p_cur, insert_sql, batch_data, page_size=batch_size)
-            
-            batch_inserted = p_cur.rowcount if p_cur.rowcount >= 0 else 0
-            skipped_in_batch = len(batch_data) - batch_inserted
-            
-            if skipped_in_batch > 0 and pk_col:
-                found_duplicates = analyze_skips(p_cur, table_name, pk_col, batch_data, common_cols)
-                if found_duplicates:
-                    log_skips_to_file(table_name, found_duplicates, reason="Konflikt: ID existiert bereits")
-                if len(found_duplicates) < skipped_in_batch:
-                    log_skips_to_file(table_name, ["(Unbekannte IDs)"], reason="Konflikt: Anderer Unique Constraint")
+            # --- INSERT STRATEGIE V28: Robustheit ---
+            if pk_col:
+                # Versuch mit RETURNING
+                try:
+                    returned_rows = execute_values(p_cur, insert_sql, batch_data, page_size=batch_size, fetch=True)
+                    inserted_ids_set = set(r[0] for r in returned_rows)
+                    batch_inserted = len(inserted_ids_set)
+                except:
+                    # Fallback: Falls RETURNING nicht klappt (Treiber/DB-Problem), nutzen wir rowcount
+                    # Achtung: execute_values ohne fetch
+                    insert_sql_fallback = insert_sql.replace(f" RETURNING {pk_col}", "")
+                    execute_values(p_cur, insert_sql_fallback, batch_data, page_size=batch_size)
+                    batch_inserted = p_cur.rowcount
+                    inserted_ids_set = set() # Leer, also keine Skip-Analyse möglich
+
+                # Plausibilitätscheck: Wenn RETURNING 0 liefert, aber rowcount > 0, vertraue rowcount
+                if batch_inserted == 0 and p_cur.rowcount > 0:
+                    batch_inserted = p_cur.rowcount
+                
+                skipped_in_batch = len(batch_data) - batch_inserted
+                
+                if skipped_in_batch > 0 and inserted_ids_set:
+                    all_ids_set = set(batch_ids)
+                    skipped_ids = list(all_ids_set - inserted_ids_set)
+                    if skipped_ids:
+                        log_skips_to_file(table_name, skipped_ids, reason="Konflikt: ID existiert bereits")
+            else:
+                # Tabellen ohne PK
+                execute_values(p_cur, insert_sql, batch_data, page_size=batch_size)
+                batch_inserted = p_cur.rowcount
+                if batch_inserted < 0: batch_inserted = 0
+                skipped_in_batch = len(batch_data) - batch_inserted
 
             stats_inserted += batch_inserted
             stats_skipped += skipped_in_batch
@@ -875,7 +909,6 @@ def action_truncate_menu(config):
                     s_c = f"{s_cur.fetchone()[0]:,}"
                 except: pass
                 
-                # Faked table column look using fixed widths
                 label = f"{name:<25} │ PG: {p_c:>10} │ SQ: {s_c:>10}"
                 choices.append(questionary.Choice(label, value=name))
         s_conn.close()
@@ -885,12 +918,12 @@ def action_truncate_menu(config):
     if not choices:
         choices = [questionary.Choice(t['name']) for t in TABLES_CONF]
 
-    # Print a header for the fake table
     console.print(f"   {'Tabelle':<25} │ {'Postgres':>10}   │ {'SQLite':>10}")
     console.print(f" {'─'*27}┼{'─'*14}┼{'─'*13}")
 
     targets = questionary.checkbox("Welche Tabellen leeren?", choices=choices).ask()
-    if not targets: return
+    if not targets:
+        return
     
     if not questionary.confirm(f"Wirklich {len(targets)} Tabellen unwiderruflich leeren?", default=False).ask():
         return
@@ -935,7 +968,7 @@ def action_maintenance(config):
 
 def main():
     console.clear()
-    console.print(Panel.fit("[bold blue]Home Assistant Migration Tool[/bold blue]\n[dim]Next-Gen Edition (v26 - Clean UI)[/dim]", box=box.DOUBLE))
+    console.print(Panel.fit("[bold blue]Home Assistant Migration Tool[/bold blue]\n[dim]Next-Gen Edition (v28 - Reliable Counters)[/dim]", box=box.DOUBLE))
     if not os.path.exists(CONFIG_FILE):
         if questionary.confirm("Keine Konfiguration gefunden. Jetzt erstellen?").ask():
             action_create_config()
