@@ -38,18 +38,19 @@ SKIP_LOG_FILE = "migration_skipped.log"
 
 console = Console()
 
+# --- UPDATE v33: Nutzung der _ts Spalten (Timestamp) statt der alten String-Spalten ---
 TABLES_CONF = [
     {"name": "event_data", "pk": "data_id"},
     {"name": "event_types", "pk": "event_type_id"},
-    {"name": "events", "pk": "event_id", "time_col": "time_fired"},
-    {"name": "recorder_runs", "pk": "run_id", "time_col": "start"},
+    {"name": "events", "pk": "event_id", "time_col": "time_fired_ts"}, 
+    {"name": "recorder_runs", "pk": "run_id", "time_col": "start_ts"},
     {"name": "state_attributes", "pk": "attributes_id"},
     {"name": "states_meta", "pk": "metadata_id"},
-    {"name": "states", "pk": "state_id", "time_col": "last_updated", "drop_fk": ["states_old_state_id_fkey"]},
+    {"name": "states", "pk": "state_id", "time_col": "last_updated_ts", "drop_fk": ["states_old_state_id_fkey"]},
     {"name": "statistics_meta", "pk": "id"},
-    {"name": "statistics_runs", "pk": "run_id", "time_col": "start"},
-    {"name": "statistics", "pk": "id", "time_col": "start", "segment_by": "metadata_id"},
-    {"name": "statistics_short_term", "pk": "id", "time_col": "start", "segment_by": "metadata_id"},
+    {"name": "statistics_runs", "pk": "run_id", "time_col": "start_ts"},
+    {"name": "statistics", "pk": "id", "time_col": "start_ts", "segment_by": "metadata_id"},
+    {"name": "statistics_short_term", "pk": "id", "time_col": "start_ts", "segment_by": "metadata_id"},
     {"name": "schema_changes", "pk": "change_id"},
 ]
 
@@ -248,16 +249,35 @@ def get_blocking_constraints(p_cur, table_name):
     except:
         return []
 
-def get_db_resume_point(p_cur, table_name, pk_col, max_src_id):
-    if not pk_col or max_src_id == 0:
-        return 0
+def get_extended_db_stats(p_cur, table_name, pk_col, s_max):
+    stats = {"resume": 0, "barrier": None, "head": 0, "seq": 0}
+    if not pk_col:
+        return stats
+    
     try:
-        query = f"SELECT MAX({pk_col}) FROM public.{table_name} WHERE {pk_col} < %s"
-        p_cur.execute(query, (max_src_id,))
+        if s_max > 0:
+            p_cur.execute(f"SELECT MAX({pk_col}) FROM public.{table_name} WHERE {pk_col} < %s", (s_max,))
+            res = p_cur.fetchone()[0]
+            stats["resume"] = res if res else 0
+        
+        if s_max > 0:
+            p_cur.execute(f"SELECT MIN({pk_col}) FROM public.{table_name} WHERE {pk_col} > %s", (s_max,))
+            res = p_cur.fetchone()[0]
+            stats["barrier"] = res
+            
+        p_cur.execute(f"SELECT MAX({pk_col}) FROM public.{table_name}")
         res = p_cur.fetchone()[0]
-        return res if res is not None else 0
+        stats["head"] = res if res else 0
+        
+        p_cur.execute(f"SELECT pg_get_serial_sequence('public.{table_name}', '{pk_col}')")
+        seq_res = p_cur.fetchone()
+        if seq_res and seq_res[0]:
+            p_cur.execute(f"SELECT last_value FROM {seq_res[0]}")
+            stats["seq"] = p_cur.fetchone()[0]
     except:
-        return 0
+        pass
+        
+    return stats
 
 # ================= CORE LOGIC: CONVERTERS =================
 
@@ -324,11 +344,14 @@ def analyze_skips(p_cur, table_name, pk_col, batch_data, common_cols):
         return []
 
 def run_preflight_analysis(s_conn, p_conn, plan):
-    console.print(Panel("[bold]Analyse & Smart Resume Check[/bold]", box=box.ROUNDED))
+    console.print(Panel("[bold]Pre-Flight: Gap-Analyse & Synchronisation[/bold]", box=box.ROUNDED))
     table = Table(box=box.SIMPLE)
     table.add_column("Tabelle", style="cyan")
-    table.add_column("SQLite Max", justify="right")
-    table.add_column("Postgres Max", justify="right", style="dim")
+    table.add_column("SQ Max", justify="right", header_style="bold green")
+    table.add_column("PG Resume", justify="right", style="dim")
+    table.add_column("PG Barrier", justify="right", style="bold red")
+    table.add_column("PG Head", justify="right", style="dim")
+    table.add_column("Seq", justify="right")
     table.add_column("Start-Aktion", style="bold")
 
     progress_data = load_json(PROGRESS_FILE)
@@ -339,7 +362,10 @@ def run_preflight_analysis(s_conn, p_conn, plan):
         for t_name in plan:
             tbl_conf = TABLE_MAP[t_name]
             pk_col = tbl_conf.get('pk')
-            s_max = 0; p_max = 0; action = "Full Scan"
+            
+            s_max = 0
+            stats = {"resume": 0, "barrier": None, "head": 0, "seq": 0}
+            action = "Full Scan"
             
             if pk_col:
                 try:
@@ -347,19 +373,31 @@ def run_preflight_analysis(s_conn, p_conn, plan):
                 except:
                     s_max = 0
                 
-                p_max = get_db_resume_point(p_cur, t_name, pk_col, s_max)
+                stats = get_extended_db_stats(p_cur, t_name, pk_col, s_max)
+                
                 file_start = progress_data.get(t_name, 0)
-                start_point = max(file_start, p_max)
+                start_point = max(file_start, stats["resume"])
                 
                 if start_point >= s_max and s_max > 0:
-                    action = "[green]✅ Fertig (Skip)[/green]"
+                    action = "[green]✅ Fertig[/green]"
                 elif start_point > 0:
-                    action = f"[yellow]⏩ Resume @ {start_point:,}[/yellow]"
+                    action = f"[yellow]⏩ {start_point:,}[/yellow]"
                 else:
-                    action = "[blue]▶️ Start bei 0[/blue]"
+                    action = "[blue]▶️ 0[/blue]"
+                
+                barrier_str = f"{stats['barrier']:,}" if stats['barrier'] else "-"
+                
+                table.add_row(
+                    t_name, 
+                    f"{s_max:,}", 
+                    f"{stats['resume']:,}", 
+                    barrier_str,
+                    f"{stats['head']:,}",
+                    f"{stats['seq']:,}",
+                    action
+                )
             else:
-                action = "Full Scan (No PK)"
-            table.add_row(t_name, f"{s_max:,}", f"{p_max:,}", action)
+                table.add_row(t_name, "-", "-", "-", "-", "-", "Full Scan (No PK)")
 
     p_cur.close()
     console.print(table)
@@ -401,7 +439,6 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
     conflict_sql = "ON CONFLICT DO NOTHING"
     insert_sql = f"INSERT INTO public.{table_name} ({', '.join(quoted_cols)}) VALUES %s {conflict_sql}"
     
-    # Optional RETURNING für Skip-Analyse
     if pk_col:
         insert_sql += f" RETURNING {pk_col}"
 
@@ -419,9 +456,9 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
         if pk_col:
             max_src_id = get_max_id(s_cur, table_name, pk_col)
             if final_start_id == 0 and max_src_id > 0:
-                db_resume_point = get_db_resume_point(p_cur, table_name, pk_col, max_src_id)
-                if db_resume_point > 0:
-                    final_start_id = db_resume_point
+                stats = get_extended_db_stats(p_cur, table_name, pk_col, max_src_id)
+                if stats["resume"] > 0:
+                    final_start_id = stats["resume"]
 
             if final_start_id > 0 and final_start_id < max_src_id:
                 s_cur.execute(f"SELECT COUNT(*) FROM {table_name} WHERE {pk_col} > ?", (final_start_id,))
@@ -483,22 +520,17 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
                     if pk_idx >= 0:
                         batch_ids.append(clean_row[pk_idx])
 
-            # --- INSERT STRATEGIE V28: Robustheit ---
             if pk_col:
-                # Versuch mit RETURNING
                 try:
                     returned_rows = execute_values(p_cur, insert_sql, batch_data, page_size=batch_size, fetch=True)
                     inserted_ids_set = set(r[0] for r in returned_rows)
                     batch_inserted = len(inserted_ids_set)
                 except:
-                    # Fallback: Falls RETURNING nicht klappt (Treiber/DB-Problem), nutzen wir rowcount
-                    # Achtung: execute_values ohne fetch
                     insert_sql_fallback = insert_sql.replace(f" RETURNING {pk_col}", "")
                     execute_values(p_cur, insert_sql_fallback, batch_data, page_size=batch_size)
                     batch_inserted = p_cur.rowcount
-                    inserted_ids_set = set() # Leer, also keine Skip-Analyse möglich
+                    inserted_ids_set = set()
 
-                # Plausibilitätscheck: Wenn RETURNING 0 liefert, aber rowcount > 0, vertraue rowcount
                 if batch_inserted == 0 and p_cur.rowcount > 0:
                     batch_inserted = p_cur.rowcount
                 
@@ -510,7 +542,6 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
                     if skipped_ids:
                         log_skips_to_file(table_name, skipped_ids, reason="Konflikt: ID existiert bereits")
             else:
-                # Tabellen ohne PK
                 execute_values(p_cur, insert_sql, batch_data, page_size=batch_size)
                 batch_inserted = p_cur.rowcount
                 if batch_inserted < 0: batch_inserted = 0
@@ -634,28 +665,48 @@ def action_convert_schema(config):
             for tbl in targets:
                 name = tbl['name']
                 progress.update(task, description=f"Konvertiere {name}...")
+                
+                # --- AUTO-CLEANUP v32/33 ---
+                # Wir checken jetzt die _ts Spalte auf NULL
+                time_col = tbl['time_col']
+                try:
+                    c.execute(f"SELECT COUNT(*) FROM {name} WHERE {time_col} IS NULL;")
+                    null_count = c.fetchone()[0]
+                    if null_count > 0:
+                        progress.update(task, description=f"Lösche {null_count} defekte Zeilen (NULL {time_col})...")
+                        c.execute(f"DELETE FROM {name} WHERE {time_col} IS NULL;")
+                        p_conn.commit()
+                except Exception as e:
+                    console.print(f"[yellow]Warnung beim Bereinigen von {name}: {e}[/yellow]")
+                
                 try:
                     if "drop_fk" in tbl:
                         for fk in tbl["drop_fk"]:
                             try:
+                                c.execute(f"SAVEPOINT drop_fk_{fk}")
                                 c.execute(f"ALTER TABLE {name} DROP CONSTRAINT IF EXISTS {fk};")
+                                c.execute(f"RELEASE SAVEPOINT drop_fk_{fk}")
                             except:
-                                pass
+                                c.execute(f"ROLLBACK TO SAVEPOINT drop_fk_{fk}")
+
                     try:
+                        c.execute(f"SAVEPOINT drop_pk_{name}")
                         c.execute(f"ALTER TABLE {name} DROP CONSTRAINT {name}_pkey CASCADE;")
+                        c.execute(f"RELEASE SAVEPOINT drop_pk_{name}")
                     except:
-                        pass
-                    try:
-                        c.execute(f"ALTER TABLE {name} ADD PRIMARY KEY ({tbl['pk']}, {tbl['time_col']});")
-                    except:
-                        pass
+                        c.execute(f"ROLLBACK TO SAVEPOINT drop_pk_{name}")
+
+                    c.execute(f"ALTER TABLE {name} ADD PRIMARY KEY ({tbl['pk']}, {tbl['time_col']});")
                     
                     c.execute(f"SELECT create_hypertable('{name}', '{tbl['time_col']}', chunk_time_interval => INTERVAL '7 days', if_not_exists => TRUE, migrate_data => TRUE);")
+                    
                     if "segment_by" in tbl:
                         c.execute(f"ALTER TABLE {name} SET (timescaledb.compress, timescaledb.compress_segmentby = '{tbl['segment_by']}');")
                     else:
                         c.execute(f"ALTER TABLE {name} SET (timescaledb.compress);")
+                    
                     c.execute(f"SELECT add_compression_policy('{name}', INTERVAL '14 days');")
+                    
                     p_conn.commit()
                     console.print(f"[green]✓ {name} konvertiert[/green]")
                 except Exception as e:
@@ -968,7 +1019,7 @@ def action_maintenance(config):
 
 def main():
     console.clear()
-    console.print(Panel.fit("[bold blue]Home Assistant Migration Tool[/bold blue]\n[dim]Next-Gen Edition (v28 - Reliable Counters)[/dim]", box=box.DOUBLE))
+    console.print(Panel.fit("[bold blue]Home Assistant Migration Tool[/bold blue]\n[dim]Next-Gen Edition (v33 - Schema Fix)[/dim]", box=box.DOUBLE))
     if not os.path.exists(CONFIG_FILE):
         if questionary.confirm("Keine Konfiguration gefunden. Jetzt erstellen?").ask():
             action_create_config()
