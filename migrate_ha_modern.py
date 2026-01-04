@@ -1,6 +1,6 @@
 """
 Home Assistant Migration Tool (SQLite to PostgreSQL)
-Version: 69 (Production Grade + Adaptive Batching + Verification)
+Version: 70 (Production Grade + Repair Visualizer + Config Editor)
 Author: Gemini (AI)
 License: MIT
 
@@ -12,7 +12,9 @@ KEY FEATURES:
 1. Global Layering: Migrates metadata first to satisfy Foreign Keys.
 2. Fast Mode: Temporarily disables constraints for speed (if possible).
 3. Live-Start: Sets sequences early so HA can run during history import.
-4. Smart Repair: Dual-Mode repair center for SQLite and Postgres.
+4. Smart Repair: 
+   - Fixes 'Ghost Data' (ID reassignment).
+   - VISUALIZATION: Draws ASCII timelines to show data overlaps/gaps before merging.
 5. Auto-Healing: Adaptive Batch Size reduces automatically on connection drops.
 6. Verification: Post-migration audit comparing row counts.
 """
@@ -28,6 +30,7 @@ import os
 import json
 import time
 import re
+import math
 
 # UI Libraries
 from rich.console import Console
@@ -56,7 +59,7 @@ DEFAULT_CONFIG = {
     "pg_db": "homeassistant",
     "pg_user": "homeassistant",
     "pg_pass": "",
-    "batch_size": 10000,  # Starting Value (will adapt automatically)
+    "batch_size": 10000,
     "seq_buffer": 50000,
     "timescale_enabled": False
 }
@@ -193,6 +196,52 @@ def format_ts(ts):
     except:
         return str(ts)
 
+def generate_ascii_timeline(stats_list, width=30):
+    """
+    Generates a visual bar chart string for overlapping time ranges.
+    Input: List of dicts {id, min_ts, max_ts}
+    Output: String representation
+    """
+    if not stats_list:
+        return ""
+    
+    # Filter valid timestamps
+    valid_ranges = [s for s in stats_list if s['min_ts'] and s['max_ts'] and s['max_ts'] > 0]
+    if not valid_ranges:
+        return "[Keine Zeitdaten]"
+
+    global_min = min(s['min_ts'] for s in valid_ranges)
+    global_max = max(s['max_ts'] for s in valid_ranges)
+    total_span = global_max - global_min
+    
+    if total_span <= 0:
+        return "[Zeitraum zu kurz]"
+
+    output_lines = []
+    
+    for s in stats_list:
+        if not s['min_ts'] or not s['max_ts']:
+            output_lines.append(f"ID {s['id']}: [Keine Daten]")
+            continue
+            
+        # Calculate relative position
+        start_pct = (s['min_ts'] - global_min) / total_span
+        end_pct = (s['max_ts'] - global_min) / total_span
+        
+        # Map to chars
+        start_idx = int(start_pct * width)
+        end_idx = int(end_pct * width)
+        # Ensure at least 1 char width if there is data
+        if end_idx == start_idx:
+            end_idx += 1
+            
+        bar = "░" * start_idx + "█" * (end_idx - start_idx) + "░" * (width - end_idx)
+        # Trim to width just in case
+        bar = bar[:width]
+        output_lines.append(f"ID {s['id']}: [{bar}]")
+        
+    return "\n".join(output_lines)
+
 # ==============================================================================
 # DB CONNECTION MANAGERS
 # ==============================================================================
@@ -221,7 +270,7 @@ class PostgresManager:
                 database=self.cfg["pg_db"],
                 user=self.cfg["pg_user"],
                 password=self.cfg["pg_pass"],
-                application_name="ha_migrator_v69",
+                application_name="ha_migrator_v70",
                 connect_timeout=10,
                 keepalives=1,
                 keepalives_idle=30,
@@ -509,10 +558,6 @@ def run_preflight_analysis(s_conn, p_conn, plan):
     console.print("")
 
 def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progress, task_id, current_batch_size):
-    """
-    Migrates a single table using batch processing.
-    Returns dictionary with status and specific error messages for adaptive handling.
-    """
     table_name = tbl_conf['name']
     pk_col = tbl_conf.get('pk')
     
@@ -909,6 +954,8 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
                 HAVING count(*) > 1;
             """
         elif repair_type == "suffixes":
+            # SQLite Regexp: Note the different string concat syntax and no jsonb
+            # FIX: Use raw string r"""...""" to avoid Python SyntaxWarning on '\.'
             search_sql = r"""
                 SELECT 
                     m1.statistic_id, 
@@ -941,31 +988,33 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
             for row in candidates:
                 if merge_mode:
                     if db_type == "postgres":
+                        # Postgres returns list directly due to jsonb_agg
                         if len(row) == 2:
                             name = row[0]
                             ids = row[1]
-                        else:
-                            continue
+                        else: continue
                     else:
+                        # SQLite returns JSON string "[1, 2]"
                         name = row[0]
                         try:
                             ids = json.loads(row[1])
                         except:
                             continue
 
+                    # Dedup IDs
                     ids = sorted(list(set(ids)))
 
                     stats = []
                     for eid in ids:
                         try:
-                            q_lts = "SELECT COUNT(*), MIN(start_ts), MAX(start_ts) FROM statistics WHERE metadata_id = %s" if db_type == 'postgres' else "SELECT COUNT(*), MIN(start_ts), MAX(start_ts) FROM statistics WHERE metadata_id = ?"
-                            cur.execute(q_lts, (eid,))
+                            # Query works for both DBs (mostly standard SQL)
+                            cur.execute("SELECT COUNT(*), MIN(start_ts), MAX(start_ts) FROM statistics WHERE metadata_id = %s" if db_type == 'postgres' else "SELECT COUNT(*), MIN(start_ts), MAX(start_ts) FROM statistics WHERE metadata_id = ?", (eid,))
                             res_lts = cur.fetchone()
                             
-                            q_st = "SELECT COUNT(*) FROM statistics_short_term WHERE metadata_id = %s" if db_type == 'postgres' else "SELECT COUNT(*) FROM statistics_short_term WHERE metadata_id = ?"
-                            cur.execute(q_st, (eid,))
+                            cur.execute("SELECT COUNT(*) FROM statistics_short_term WHERE metadata_id = %s" if db_type == 'postgres' else "SELECT COUNT(*) FROM statistics_short_term WHERE metadata_id = ?", (eid,))
                             cnt_st = cur.fetchone()[0]
                             
+                            # Handle None results
                             rows = (res_lts[0] or 0) + (cnt_st or 0)
                             min_ts = res_lts[1]
                             max_ts = res_lts[2] or 0
@@ -979,6 +1028,7 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
                         except Exception:
                             stats.append({"id": eid, "rows": 0, "min_ts": 0, "max_ts": 0})
                     
+                    # Sort: latest timestamp wins
                     stats.sort(key=lambda x: x["max_ts"], reverse=True)
                     
                     if not stats: continue
@@ -992,27 +1042,29 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
                         "target_id": target["id"],
                         "source_ids": source_ids,
                         "target_stats": f"ID {target['id']}: {target['rows']} Zeilen ({format_ts(target['min_ts'])} - {format_ts(target['max_ts'])})",
-                        "source_stats": "\n".join([f"ID {s['id']}: {s['rows']} Zeilen ({format_ts(s['min_ts'])} - {format_ts(s['max_ts'])})" for s in sources])
+                        "source_stats": "\n".join([f"ID {s['id']}: {s['rows']} Zeilen ({format_ts(s['min_ts'])} - {format_ts(s['max_ts'])})" for s in sources]),
+                        "all_stats": stats # Pass for visualization
                     })
 
+        # Render Table with Visualization
         table = Table(title=f"Gefundene Konflikte: {len(conflicts)}", show_lines=True)
         table.add_column("Sensor", style="cyan")
         table.add_column("Merge", style="bold magenta")
-        table.add_column("Details (Ziel)", style="green")
-        table.add_column("Details (Quelle/Alt)", style="yellow")
+        table.add_column("Zeitraum & Details", style="green")
         
         for c in conflicts:
+            timeline_chart = generate_ascii_timeline(c['all_stats'])
             table.add_row(
                 c["name"],
                 f"{c['source_ids']} -> {c['target_id']}",
-                c["target_stats"],
-                c["source_stats"]
+                timeline_chart
             )
         console.print(table)
         
         if not questionary.confirm("Möchtest du diese Konflikte bearbeiten?").ask():
             return
 
+        # Interactive Loop
         with Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(), TaskProgressColumn()) as progress:
             task = progress.add_task("Bearbeite...", total=len(conflicts))
             
@@ -1041,12 +1093,17 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
                     target_id = int(questionary.text("Neue Ziel-ID:", default=str(target_id)).ask())
                 
                 try:
+                    # Execute Merge
+                    # Syntax differs significantly for array/list params
+                    
                     if db_type == "postgres":
                         cur.execute(f"UPDATE statistics SET metadata_id = {target_id} WHERE metadata_id = ANY(%s)", (c['source_ids'],))
                         cur.execute(f"UPDATE statistics_short_term SET metadata_id = {target_id} WHERE metadata_id = ANY(%s)", (c['source_ids'],))
                         cur.execute(f"DELETE FROM statistics_meta WHERE id = ANY(%s)", (c['source_ids'],))
-                    else: # SQLite
+                    else: # SQLite (No ANY(), use IN (?,?,?))
+                        # Helper for placeholders
                         placeholders = ','.join('?' * len(c['source_ids']))
+                        
                         cur.execute(f"UPDATE statistics SET metadata_id = ? WHERE metadata_id IN ({placeholders})", [target_id] + c['source_ids'])
                         cur.execute(f"UPDATE statistics_short_term SET metadata_id = ? WHERE metadata_id IN ({placeholders})", [target_id] + c['source_ids'])
                         cur.execute(f"DELETE FROM statistics_meta WHERE id IN ({placeholders})", c['source_ids'])
@@ -1066,6 +1123,7 @@ def fix_suffixes_smart(config, db_type):
     analyze_and_fix_interactive(config, "Suche Suffixe (_2, _3...)", merge_mode=True, repair_type="suffixes", db_type=db_type)
 
 def fix_missing_units_interactive(config):
+    """Finds statistics with missing Units (NULL) and offers heuristics. (Postgres Only for now)"""
     with PostgresManager(config, fast_mode=False) as p_conn:
         cur = p_conn.cursor()
         console.print("[cyan]Suche nach fehlenden Einheiten (NULL) [Postgres]...[/cyan]")
@@ -1123,7 +1181,10 @@ def fix_missing_units_interactive(config):
         console.print("[green]Fertig.[/green]")
 
 def action_fix_metadata(config):
+    """Repair Center Menu."""
     console.print(Panel("[bold]Repair Center: Statistik & Metadaten (Smart)[/bold]", box=box.ROUNDED))
+    
+    # Select DB Target
     db_target = questionary.select("Datenbank-Ziel:", choices=[
         Choice("PostgreSQL (Ziel)", value="postgres"),
         Choice("SQLite (Quelle)", value="sqlite"),
@@ -1151,6 +1212,44 @@ def action_fix_metadata(config):
 # ==============================================================================
 # ACTIONS & MENUS
 # ==============================================================================
+
+def action_edit_config():
+    """Allows user to edit the config.json via menu."""
+    config = load_json(CONFIG_FILE) or DEFAULT_CONFIG.copy()
+    
+    choices = [
+        Choice(f"SQLite Pfad: {config.get('sqlite_path')}", value="sqlite_path"),
+        Choice(f"PG Host: {config.get('pg_host')}", value="pg_host"),
+        Choice(f"PG User: {config.get('pg_user')}", value="pg_user"),
+        Choice(f"PG Pass: ***", value="pg_pass"),
+        Choice(f"Batch Size: {config.get('batch_size')}", value="batch_size"),
+        "Speichern & Zurück"
+    ]
+    
+    while True:
+        key = questionary.select("Einstellung bearbeiten:", choices=choices).ask()
+        if key == "Speichern & Zurück":
+            save_json(CONFIG_FILE, config)
+            return config
+        
+        if key == "pg_pass":
+            val = questionary.password("Neues Passwort:").ask()
+        else:
+            val = questionary.text(f"Neuer Wert für {key}:", default=str(config.get(key, ""))).ask()
+            if key == "batch_size":
+                try: val = int(val)
+                except: val = 10000
+        
+        config[key] = val
+        # Refresh choices to show new values
+        choices = [
+            Choice(f"SQLite Pfad: {config.get('sqlite_path')}", value="sqlite_path"),
+            Choice(f"PG Host: {config.get('pg_host')}", value="pg_host"),
+            Choice(f"PG User: {config.get('pg_user')}", value="pg_user"),
+            Choice(f"PG Pass: ***", value="pg_pass"),
+            Choice(f"Batch Size: {config.get('batch_size')}", value="batch_size"),
+            "Speichern & Zurück"
+        ]
 
 def action_verify_migration(config):
     """Checks row counts between SQLite and Postgres."""
@@ -1198,6 +1297,7 @@ def action_verify_migration(config):
     questionary.press_any_key_to_continue().ask()
 
 def action_create_config():
+    """Interactive wizard to generate the config.json file."""
     console.print(Panel("[bold]Konfiguration erstellen[/bold]", box=box.ROUNDED))
     current = load_json(CONFIG_FILE) or DEFAULT_CONFIG.copy()
     config = {}
@@ -1216,6 +1316,7 @@ def action_create_config():
     return config
 
 def action_reset_progress():
+    """Menu to delete progress file (Full or Partial)."""
     data = load_json(PROGRESS_FILE)
     if not data:
         console.print("[yellow]Keine Daten.[/yellow]")
@@ -1237,9 +1338,11 @@ def action_reset_progress():
     questionary.press_any_key_to_continue().ask()
 
 def action_sequence_reset(config):
+    """Manually resets PostgreSQL sequences."""
     console.print(Panel("[bold]Pre-Flight Check: Sequenzen[/bold]", box=box.ROUNDED))
     s_conn = connect_sqlite_ro(config["sqlite_path"])
-    if not s_conn: return
+    if not s_conn:
+        return
     with console.status("[bold green]Verbinde mit Postgres...") as status:
         with PostgresManager(config, fast_mode=False) as p_conn:
             p_cur = p_conn.cursor()
@@ -1249,7 +1352,8 @@ def action_sequence_reset(config):
             for tbl in TABLES_CONF:
                 name = tbl['name']
                 pk = tbl.get('pk')
-                if not pk: continue
+                if not pk:
+                    continue
                 max_sqlite = get_max_id(s_conn.cursor(), name, pk)
                 updated, curr, target = update_sequence_if_needed(p_cur, name, pk, max_sqlite, config['seq_buffer'])
                 table.add_row(name, f"UPDATE: {curr} -> {target}" if updated else f"OK ({curr} > {target})")
@@ -1259,6 +1363,7 @@ def action_sequence_reset(config):
     questionary.press_any_key_to_continue().ask()
 
 def action_convert_schema(config):
+    """Attempts to convert PostgreSQL tables to TimescaleDB Hypertables."""
     if not config.get("timescale_enabled", False):
         console.print("[yellow]Hinweis: TimescaleDB ist deaktiviert.[/yellow]")
         if not questionary.confirm("Trotzdem versuchen?").ask():
@@ -1303,6 +1408,7 @@ def action_convert_schema(config):
     questionary.press_any_key_to_continue().ask()
 
 def action_show_stats(config):
+    """Checks the row counts in both databases."""
     action_verify_migration(config)
 
 def action_vacuum_menu(config):
@@ -1398,7 +1504,7 @@ def action_sqlite_maintenance(config):
 
 def action_maintenance(config):
     while True:
-        choice = questionary.select("Option:", choices=["Sequenzen Reset", "Repair Center (Smart)", "DB Status", "Postgres VACUUM", "Postgres TRUNCATE", "SQLite Wartung", "Reset Progress", "Zurück"]).ask()
+        choice = questionary.select("Option:", choices=["Sequenzen Reset", "Repair Center (Smart)", "DB Status", "Postgres VACUUM", "Postgres TRUNCATE", "SQLite Wartung", "Config Editor", "Reset Progress", "Zurück"]).ask()
         if choice == "Zurück":
             return
         if choice == "Sequenzen Reset":
@@ -1413,6 +1519,8 @@ def action_maintenance(config):
             action_truncate_menu(config)
         if choice == "SQLite Wartung":
             action_sqlite_maintenance(config)
+        if choice == "Config Editor":
+            config = action_edit_config() # Updates the config object in runtime
         if choice == "Reset Progress":
             action_reset_progress()
 
@@ -1426,7 +1534,7 @@ def action_migration_menu(config):
 
 def main():
     console.clear()
-    console.print(Panel.fit("[bold blue]Home Assistant Migration Tool[/bold blue]\n[dim]v69 - Final Production Release[/dim]", box=box.DOUBLE))
+    console.print(Panel.fit("[bold blue]Home Assistant Migration Tool[/bold blue]\n[dim]v70 - Final Production Release[/dim]", box=box.DOUBLE))
     if not os.path.exists(CONFIG_FILE):
         action_create_config()
     config = load_json(CONFIG_FILE)
