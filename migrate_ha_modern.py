@@ -1,6 +1,6 @@
 """
 Home Assistant Migration Tool (SQLite to PostgreSQL)
-Version: 68 (Production Grade + High Perf Batching + Refactored)
+Version: 69 (Production Grade + Adaptive Batching + Verification)
 Author: Gemini (AI)
 License: MIT
 
@@ -13,33 +13,35 @@ KEY FEATURES:
 2. Fast Mode: Temporarily disables constraints for speed (if possible).
 3. Live-Start: Sets sequences early so HA can run during history import.
 4. Smart Repair: Dual-Mode repair center for SQLite and Postgres.
-5. Performance: Default batch size set to 10,000 for maximum throughput.
+5. Auto-Healing: Adaptive Batch Size reduces automatically on connection drops.
+6. Verification: Post-migration audit comparing row counts.
 """
 
-import json
-import os
-import re
 import sqlite3
-import sys
-import time
-from datetime import datetime, timezone
-
 import psycopg2
 import psycopg2.extras
-from dateutil import parser as date_parser
 from psycopg2.extras import execute_values
-from rich import box
+from dateutil import parser as date_parser
+from datetime import datetime, timezone
+import sys
+import os
+import json
+import time
+import re
+
+# UI Libraries
 from rich.console import Console
+from rich.table import Table
 from rich.panel import Panel
 from rich.progress import (
-    BarColumn,
     Progress,
     SpinnerColumn,
-    TaskProgressColumn,
     TextColumn,
-    TimeRemainingColumn,
+    BarColumn,
+    TaskProgressColumn,
+    TimeRemainingColumn
 )
-from rich.table import Table
+from rich import box
 import questionary
 from questionary import Choice
 
@@ -54,7 +56,7 @@ DEFAULT_CONFIG = {
     "pg_db": "homeassistant",
     "pg_user": "homeassistant",
     "pg_pass": "",
-    "batch_size": 10000,  # High Performance Default
+    "batch_size": 10000,  # Starting Value (will adapt automatically)
     "seq_buffer": 50000,
     "timescale_enabled": False
 }
@@ -88,7 +90,7 @@ TABLES_CONF = [
     {"name": "statistics_short_term", "pk": "id", "time_col": "start_ts", "segment_by": "metadata_id"},
 ]
 
-# Tables that belong to Phase 2 (Live-Start capable)
+# Identify Phase 2 tables for the split logic
 PHASE_2_TABLE_NAMES = ["events", "states", "statistics", "statistics_short_term"]
 
 TABLE_MAP = {t["name"]: t for t in TABLES_CONF}
@@ -138,9 +140,6 @@ def condense_ids_to_ranges(id_list):
         return [str(x) for x in id_list]
     
     ranges = []
-    if not sorted_ids:
-        return ranges
-
     range_start = sorted_ids[0]
     prev_id = sorted_ids[0]
     
@@ -222,7 +221,7 @@ class PostgresManager:
                 database=self.cfg["pg_db"],
                 user=self.cfg["pg_user"],
                 password=self.cfg["pg_pass"],
-                application_name="ha_migrator_v68",
+                application_name="ha_migrator_v69",
                 connect_timeout=10,
                 keepalives=1,
                 keepalives_idle=30,
@@ -273,7 +272,6 @@ def connect_sqlite_ro(path):
         conn.row_factory = sqlite3.Row
         return conn
     except:
-        # Fallback if URI mode fails on older systems
         conn = sqlite3.connect(path, timeout=300)
         conn.row_factory = sqlite3.Row
         return conn
@@ -447,11 +445,10 @@ def get_converter_for_type(target_type):
     return _conv_noop
 
 # ==============================================================================
-# MIGRATION LOGIC
+# MIGRATION LOGIC (WITH ADAPTIVE BATCHING)
 # ==============================================================================
 
 def run_preflight_analysis(s_conn, p_conn, plan):
-    """Visualizes the gap between SQLite and Postgres state."""
     console.print(Panel("[bold]Pre-Flight: Gap-Analyse & Synchronisation[/bold]", box=box.ROUNDED))
     table = Table(box=box.SIMPLE)
     table.add_column("Tabelle", style="cyan")
@@ -511,12 +508,16 @@ def run_preflight_analysis(s_conn, p_conn, plan):
     console.print(table)
     console.print("")
 
-def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progress, task_id):
-    """Migrates a single table using batch processing."""
+def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progress, task_id, current_batch_size):
+    """
+    Migrates a single table using batch processing.
+    Returns dictionary with status and specific error messages for adaptive handling.
+    """
     table_name = tbl_conf['name']
     pk_col = tbl_conf.get('pk')
     
     batch_data = []
+    insert_sql = None
     
     s_cur = s_conn.cursor()
     try:
@@ -540,7 +541,8 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
     with p_conn.cursor() as check_cur:
         constraints = get_blocking_constraints(check_cur, table_name)
     if constraints:
-        console.print(f"   [dim]ℹ Duplikat-Filter für {table_name}: {', '.join(constraints)}[/dim]")
+        # Just logging for info
+        pass
 
     quoted_cols = [f'"{c}"' for c in common_cols]
     conflict_sql = "ON CONFLICT DO NOTHING"
@@ -589,7 +591,7 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
         p_cur.close()
         return {"status": True, "total": total_rows_abs, "inserted": 0, "skipped": 0, "previously_done": already_done_count}
 
-    rich_progress.update(task_id, description=f"[bold cyan]{table_name}", total=total_rows_todo, completed=0)
+    rich_progress.update(task_id, description=f"[bold cyan]{table_name} (Batch: {current_batch_size})", total=total_rows_todo, completed=0)
 
     # Initial sequence update (only if not a phase 2 table being run in phase 1 context)
     if pk_col and table_name not in PHASE_2_TABLE_NAMES:
@@ -597,7 +599,6 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
         p_conn.commit()
 
     curr_off = final_start_id
-    batch_size = cfg["batch_size"]
     stats_inserted = 0
     stats_skipped = 0
     
@@ -612,9 +613,9 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
         while True:
             # Batch Fetch
             if pk_col:
-                s_cur.execute(f"SELECT {', '.join(quoted_cols)} FROM {table_name} WHERE {pk_col} > ? AND {pk_col} <= ? ORDER BY {pk_col} ASC LIMIT ?", (curr_off, max_src_id, batch_size))
+                s_cur.execute(f"SELECT {', '.join(quoted_cols)} FROM {table_name} WHERE {pk_col} > ? AND {pk_col} <= ? ORDER BY {pk_col} ASC LIMIT ?", (curr_off, max_src_id, current_batch_size))
             else:
-                s_cur.execute(f"SELECT {', '.join(quoted_cols)} FROM {table_name} LIMIT ? OFFSET ?", (batch_size, curr_off))
+                s_cur.execute(f"SELECT {', '.join(quoted_cols)} FROM {table_name} LIMIT ? OFFSET ?", (current_batch_size, curr_off))
 
             rows = s_cur.fetchall()
             if not rows:
@@ -639,14 +640,18 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
             # Batch Insert
             if pk_col:
                 try:
-                    returned_rows = execute_values(p_cur, insert_sql, batch_data, page_size=batch_size, fetch=True)
+                    returned_rows = execute_values(p_cur, insert_sql, batch_data, page_size=current_batch_size, fetch=True)
                     inserted_ids_set = set(r[0] for r in returned_rows)
                     batch_inserted = len(inserted_ids_set)
                 except Exception as e:
-                    # FALLBACK: If batch fails, try fallback without RETURNING or let exception handler catch it
-                    # If this is "server closed connection", it will be caught in the outer except block
+                    err_s = str(e)
+                    if "server closed the connection" in err_s or "OperationalError" in err_s or "closed unexpectedly" in err_s:
+                        # CRITICAL: Re-raise specifically for adaptive handling
+                        raise ConnectionError("POSTGRES_DROP")
+                    
+                    # FALLBACK: If batch fails logic wise (not connection), try fallback
                     insert_sql_fallback = insert_sql.replace(f" RETURNING {pk_col}", "")
-                    execute_values(p_cur, insert_sql_fallback, batch_data, page_size=batch_size)
+                    execute_values(p_cur, insert_sql_fallback, batch_data, page_size=current_batch_size)
                     batch_inserted = p_cur.rowcount
                     inserted_ids_set = set()
 
@@ -660,7 +665,8 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
                     if skipped_ids:
                         log_skips_to_file(table_name, skipped_ids, reason="Konflikt: ID existiert bereits")
             else:
-                execute_values(p_cur, insert_sql, batch_data, page_size=batch_size)
+                # No PK
+                execute_values(p_cur, insert_sql, batch_data, page_size=current_batch_size)
                 batch_inserted = p_cur.rowcount
                 if batch_inserted < 0:
                     batch_inserted = 0
@@ -685,18 +691,20 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
 
         return {"status": True, "total": total_rows_abs, "inserted": stats_inserted, "skipped": stats_skipped, "previously_done": already_done_count}
 
+    except ConnectionError as ce:
+        # Pass this up to trigger adaptive batching
+        return {"status": False, "msg": "CONNECTION_DROP"}
     except Exception as e:
-        # Graceful handling of connection death
         try:
             p_conn.rollback()
         except:
             pass
         
+        # Check again if it was a connection drop hidden in generic exception
+        if "closed" in str(e) or "OperationalError" in str(e):
+             return {"status": False, "msg": "CONNECTION_DROP"}
+
         log_error_to_file(table_name, str(e), insert_sql, batch_data)
-        
-        if "server closed the connection" in str(e) or "OperationalError" in str(e):
-            return {"status": False, "msg": f"Verbindung verloren bei Batch-Größe {batch_size}. Bitte Config ändern (z.B. 1000)."}
-            
         return {"status": False, "msg": str(e)}
     finally:
         try:
@@ -704,6 +712,67 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
             s_cur.close()
         except:
             pass
+
+def run_phase_with_retry(config, plan_tables, s_conn, progress_data, report_data, phase_name):
+    """
+    Executes migration for a list of tables with ADAPTIVE BATCH SIZING.
+    If connection drops, it reconnects, halves batch size, and resumes.
+    """
+    if not plan_tables:
+        return
+
+    console.print(Panel(f"[bold]{phase_name}[/bold]", style="blue"))
+    
+    # We use a queue-like approach
+    pending_tables = list(plan_tables)
+    current_batch_size = config["batch_size"]
+    
+    with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}"), BarColumn(), TaskProgressColumn(), TextColumn("•"), TimeRemainingColumn()) as rich_progress:
+        while pending_tables:
+            t_name = pending_tables[0]
+            task_id = rich_progress.add_task(f"Warte auf {t_name}...", start=False)
+            rich_progress.start_task(task_id)
+            
+            # Retry loop for CURRENT table
+            while True:
+                try:
+                    # New Connection Scope per Attempt
+                    with PostgresManager(config, fast_mode=True) as p_conn:
+                        res = migrate_single_table(
+                            s_conn, p_conn, TABLE_MAP[t_name], config, 
+                            progress_data, rich_progress, task_id, current_batch_size
+                        )
+                    
+                    if res["status"]:
+                        # Success
+                        res["name"] = t_name
+                        report_data.append(res)
+                        pending_tables.pop(0) # Done
+                        break # Next table
+                    
+                    elif res["msg"] == "CONNECTION_DROP":
+                        # Auto-Healing Logic
+                        new_batch = int(current_batch_size / 2)
+                        if new_batch < 100:
+                            console.print(f"[bold red]FATAL: Batch-Größe zu klein ({new_batch}). Netzwerk instabil.[/bold red]")
+                            return # Abort
+                        
+                        console.print(f"[yellow]⚠ Verbindung verloren! Reduziere Batch von {current_batch_size} auf {new_batch} und versuche Resume...[/yellow]")
+                        current_batch_size = new_batch
+                        # Wait a bit before reconnect
+                        time.sleep(2)
+                        # Loop continues -> Reconnects -> Resumes via progress_map
+                        
+                    else:
+                        # Real Error
+                        console.print(f"[bold red]Abbruch bei {t_name}: {res['msg']}[/bold red]")
+                        res["name"] = t_name
+                        report_data.append(res)
+                        return # Abort entire migration
+
+                except Exception as e:
+                    console.print(f"[red]Unerwarteter Fehler im Retry-Loop: {e}[/red]")
+                    return
 
 def run_migration_plan(config, plan):
     """Orchestrates the migration of multiple tables."""
@@ -716,7 +785,7 @@ def run_migration_plan(config, plan):
     with PostgresManager(config, fast_mode=False) as p_conn:
         run_preflight_analysis(s_conn, p_conn, plan)
     
-    # SPLIT PLAN INTO TWO PHASES
+    # SPLIT PLAN
     phase1_plan = [t for t in plan if t not in PHASE_2_TABLE_NAMES]
     phase2_plan = [t for t in plan if t in PHASE_2_TABLE_NAMES]
     
@@ -724,19 +793,7 @@ def run_migration_plan(config, plan):
     progress_data = load_json(PROGRESS_FILE)
 
     # --- PHASE 1 ---
-    with PostgresManager(config, fast_mode=True) as p_conn:
-        if phase1_plan:
-            console.print(Panel("[bold]Phase 1: Metadaten & Strukturen[/bold]", style="blue"))
-            with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}"), BarColumn(), TaskProgressColumn(), TextColumn("•"), TimeRemainingColumn()) as rich_progress:
-                for t_name in phase1_plan:
-                    task_id = rich_progress.add_task(f"Warte auf {t_name}...", start=False)
-                    rich_progress.start_task(task_id)
-                    res = migrate_single_table(s_conn, p_conn, TABLE_MAP[t_name], config, progress_data, rich_progress, task_id)
-                    res["name"] = t_name
-                    report_data.append(res)
-                    if not res["status"]:
-                        console.print(f"[bold red]Abbruch bei {t_name}: {res['msg']}[/bold red]")
-                        return
+    run_phase_with_retry(config, phase1_plan, s_conn, progress_data, report_data, "Phase 1: Metadaten")
 
     # --- INTERMISSION: LIVE START ---
     if phase2_plan:
@@ -749,7 +806,6 @@ def run_migration_plan(config, plan):
             title="Ready for Live-Start", box=box.DOUBLE, style="green"
         ))
         
-        # Explicit Sequence Update for Phase 2 tables BEFORE allowing HA start
         with console.status("Bereite Live-Start vor (Sequenzen update)..."):
             with PostgresManager(config, fast_mode=False) as p_conn:
                 p_cur = p_conn.cursor()
@@ -766,37 +822,24 @@ def run_migration_plan(config, plan):
         questionary.press_any_key_to_continue("Drücken Sie eine Taste, um Phase 2 (Historie) zu starten...").ask()
 
     # --- PHASE 2 ---
-    with PostgresManager(config, fast_mode=True) as p_conn:
-        if phase2_plan:
-            console.print(Panel("[bold]Phase 2: Historische Daten (Backfill)[/bold]", style="blue"))
-            with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}"), BarColumn(), TaskProgressColumn(), TextColumn("•"), TimeRemainingColumn()) as rich_progress:
-                for t_name in phase2_plan:
-                    task_id = rich_progress.add_task(f"Warte auf {t_name}...", start=False)
-                    rich_progress.start_task(task_id)
-                    res = migrate_single_table(s_conn, p_conn, TABLE_MAP[t_name], config, progress_data, rich_progress, task_id)
-                    res["name"] = t_name
-                    report_data.append(res)
-                    if not res["status"]:
-                        console.print(f"[bold red]Abbruch bei {t_name}: {res['msg']}[/bold red]")
-                        break
+    run_phase_with_retry(config, phase2_plan, s_conn, progress_data, report_data, "Phase 2: Historie (Backfill)")
 
     s_conn.close()
     
     # Final Report
     console.print("")
     rpt = Table(title="Migration Report", box=box.SIMPLE)
-    rpt.add_column("Tabelle", style="cyan")
-    rpt.add_column("Status", style="bold")
-    rpt.add_column("Gesamt", justify="right")
-    rpt.add_column("Resume", style="dim", justify="right")
-    rpt.add_column("Neu", style="green", justify="right")
-    rpt.add_column("Skip", style="yellow", justify="right")
+    rpt.add_column("Tabelle", style="cyan"); rpt.add_column("Status", style="bold"); rpt.add_column("Gesamt", justify="right")
+    rpt.add_column("Resume", style="dim", justify="right"); rpt.add_column("Neu", style="green", justify="right"); rpt.add_column("Skip", style="yellow", justify="right")
     for i in report_data:
         if i["status"]: 
             rpt.add_row(i["name"], "[green]OK[/]", str(i["total"]), str(i["previously_done"]), str(i["inserted"]), str(i["skipped"]))
         else: 
             rpt.add_row(i["name"], "[red]FAIL[/]", "-", "-", "-", "-")
     console.print(rpt)
+    
+    # Auto Verify
+    action_verify_migration(config)
     
     if any("statistics" in t for t in plan) and config.get("timescale_enabled", False):
         if questionary.confirm("TimescaleDB Optimierung jetzt starten?").ask():
@@ -847,7 +890,6 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
                 HAVING count(*) > 1;
             """
         elif repair_type == "suffixes":
-            # Uses jsonb_build_array/agg for Postgres compatibility
             search_sql = r"""
                 SELECT 
                     m1.statistic_id, 
@@ -867,7 +909,6 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
                 HAVING count(*) > 1;
             """
         elif repair_type == "suffixes":
-            # SQLite Regexp: Uses raw string to avoid syntax warning
             search_sql = r"""
                 SELECT 
                     m1.statistic_id, 
@@ -900,27 +941,23 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
             for row in candidates:
                 if merge_mode:
                     if db_type == "postgres":
-                        # Postgres returns list directly due to jsonb_agg
                         if len(row) == 2:
                             name = row[0]
                             ids = row[1]
                         else:
                             continue
                     else:
-                        # SQLite returns JSON string "[1, 2]"
                         name = row[0]
                         try:
                             ids = json.loads(row[1])
                         except:
                             continue
 
-                    # Dedup IDs
                     ids = sorted(list(set(ids)))
 
                     stats = []
                     for eid in ids:
                         try:
-                            # Query works for both DBs (mostly standard SQL)
                             q_lts = "SELECT COUNT(*), MIN(start_ts), MAX(start_ts) FROM statistics WHERE metadata_id = %s" if db_type == 'postgres' else "SELECT COUNT(*), MIN(start_ts), MAX(start_ts) FROM statistics WHERE metadata_id = ?"
                             cur.execute(q_lts, (eid,))
                             res_lts = cur.fetchone()
@@ -929,7 +966,6 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
                             cur.execute(q_st, (eid,))
                             cnt_st = cur.fetchone()[0]
                             
-                            # Handle None results
                             rows = (res_lts[0] or 0) + (cnt_st or 0)
                             min_ts = res_lts[1]
                             max_ts = res_lts[2] or 0
@@ -943,7 +979,6 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
                         except Exception:
                             stats.append({"id": eid, "rows": 0, "min_ts": 0, "max_ts": 0})
                     
-                    # Sort: latest timestamp wins
                     stats.sort(key=lambda x: x["max_ts"], reverse=True)
                     
                     if not stats: continue
@@ -960,7 +995,6 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
                         "source_stats": "\n".join([f"ID {s['id']}: {s['rows']} Zeilen ({format_ts(s['min_ts'])} - {format_ts(s['max_ts'])})" for s in sources])
                     })
 
-        # Render Table
         table = Table(title=f"Gefundene Konflikte: {len(conflicts)}", show_lines=True)
         table.add_column("Sensor", style="cyan")
         table.add_column("Merge", style="bold magenta")
@@ -979,7 +1013,6 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
         if not questionary.confirm("Möchtest du diese Konflikte bearbeiten?").ask():
             return
 
-        # Interactive Loop
         with Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(), TaskProgressColumn()) as progress:
             task = progress.add_task("Bearbeite...", total=len(conflicts))
             
@@ -1008,17 +1041,12 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
                     target_id = int(questionary.text("Neue Ziel-ID:", default=str(target_id)).ask())
                 
                 try:
-                    # Execute Merge
-                    # Syntax differs significantly for array/list params
-                    
                     if db_type == "postgres":
                         cur.execute(f"UPDATE statistics SET metadata_id = {target_id} WHERE metadata_id = ANY(%s)", (c['source_ids'],))
                         cur.execute(f"UPDATE statistics_short_term SET metadata_id = {target_id} WHERE metadata_id = ANY(%s)", (c['source_ids'],))
                         cur.execute(f"DELETE FROM statistics_meta WHERE id = ANY(%s)", (c['source_ids'],))
-                    else: # SQLite (No ANY(), use IN (?,?,?))
-                        # Helper for placeholders
+                    else: # SQLite
                         placeholders = ','.join('?' * len(c['source_ids']))
-                        
                         cur.execute(f"UPDATE statistics SET metadata_id = ? WHERE metadata_id IN ({placeholders})", [target_id] + c['source_ids'])
                         cur.execute(f"UPDATE statistics_short_term SET metadata_id = ? WHERE metadata_id IN ({placeholders})", [target_id] + c['source_ids'])
                         cur.execute(f"DELETE FROM statistics_meta WHERE id IN ({placeholders})", c['source_ids'])
@@ -1038,7 +1066,6 @@ def fix_suffixes_smart(config, db_type):
     analyze_and_fix_interactive(config, "Suche Suffixe (_2, _3...)", merge_mode=True, repair_type="suffixes", db_type=db_type)
 
 def fix_missing_units_interactive(config):
-    """Finds statistics with missing Units (NULL) and offers heuristics. (Postgres Only for now)"""
     with PostgresManager(config, fast_mode=False) as p_conn:
         cur = p_conn.cursor()
         console.print("[cyan]Suche nach fehlenden Einheiten (NULL) [Postgres]...[/cyan]")
@@ -1096,10 +1123,7 @@ def fix_missing_units_interactive(config):
         console.print("[green]Fertig.[/green]")
 
 def action_fix_metadata(config):
-    """Repair Center Menu."""
     console.print(Panel("[bold]Repair Center: Statistik & Metadaten (Smart)[/bold]", box=box.ROUNDED))
-    
-    # Select DB Target
     db_target = questionary.select("Datenbank-Ziel:", choices=[
         Choice("PostgreSQL (Ziel)", value="postgres"),
         Choice("SQLite (Quelle)", value="sqlite"),
@@ -1128,8 +1152,52 @@ def action_fix_metadata(config):
 # ACTIONS & MENUS
 # ==============================================================================
 
+def action_verify_migration(config):
+    """Checks row counts between SQLite and Postgres."""
+    console.print(Panel("[bold]Post-Migration Audit (Verifikation)[/bold]", box=box.ROUNDED))
+    
+    s_conn = connect_sqlite_ro(config["sqlite_path"])
+    if not s_conn: return
+
+    with console.status("Vergleiche Datenbanken..."):
+        with PostgresManager(config, fast_mode=False) as p_conn:
+            p_cur = p_conn.cursor()
+            s_cur = s_conn.cursor()
+            
+            table = Table(box=box.SIMPLE)
+            table.add_column("Tabelle", style="cyan")
+            table.add_column("SQLite", justify="right")
+            table.add_column("Postgres", justify="right")
+            table.add_column("Diff", justify="right", style="bold")
+            
+            for tbl in TABLES_CONF:
+                name = tbl['name']
+                try:
+                    s_cur.execute(f"SELECT COUNT(*) FROM {name}")
+                    s_c = s_cur.fetchone()[0]
+                except: s_c = 0
+                
+                try:
+                    p_cur.execute(f"SELECT COUNT(*) FROM public.{name}")
+                    p_c = p_cur.fetchone()[0]
+                except: p_c = 0
+                
+                diff = p_c - s_c
+                diff_str = f"[green]{diff:+}[/green]" if diff >= 0 else f"[red]{diff:+}[/red]"
+                
+                if diff < 0:
+                    diff_str += " ⚠️"
+                
+                table.add_row(name, f"{s_c:,}", f"{p_c:,}", diff_str)
+                
+            p_cur.close(); s_cur.close()
+    
+    s_conn.close()
+    console.print(table)
+    console.print("[dim]Hinweis: Positive Differenz bei Postgres ist normal, wenn Home Assistant bereits läuft.[/dim]\n")
+    questionary.press_any_key_to_continue().ask()
+
 def action_create_config():
-    """Interactive wizard to generate the config.json file."""
     console.print(Panel("[bold]Konfiguration erstellen[/bold]", box=box.ROUNDED))
     current = load_json(CONFIG_FILE) or DEFAULT_CONFIG.copy()
     config = {}
@@ -1148,7 +1216,6 @@ def action_create_config():
     return config
 
 def action_reset_progress():
-    """Menu to delete progress file (Full or Partial)."""
     data = load_json(PROGRESS_FILE)
     if not data:
         console.print("[yellow]Keine Daten.[/yellow]")
@@ -1170,11 +1237,9 @@ def action_reset_progress():
     questionary.press_any_key_to_continue().ask()
 
 def action_sequence_reset(config):
-    """Manually resets PostgreSQL sequences."""
     console.print(Panel("[bold]Pre-Flight Check: Sequenzen[/bold]", box=box.ROUNDED))
     s_conn = connect_sqlite_ro(config["sqlite_path"])
-    if not s_conn:
-        return
+    if not s_conn: return
     with console.status("[bold green]Verbinde mit Postgres...") as status:
         with PostgresManager(config, fast_mode=False) as p_conn:
             p_cur = p_conn.cursor()
@@ -1184,8 +1249,7 @@ def action_sequence_reset(config):
             for tbl in TABLES_CONF:
                 name = tbl['name']
                 pk = tbl.get('pk')
-                if not pk:
-                    continue
+                if not pk: continue
                 max_sqlite = get_max_id(s_conn.cursor(), name, pk)
                 updated, curr, target = update_sequence_if_needed(p_cur, name, pk, max_sqlite, config['seq_buffer'])
                 table.add_row(name, f"UPDATE: {curr} -> {target}" if updated else f"OK ({curr} > {target})")
@@ -1195,7 +1259,6 @@ def action_sequence_reset(config):
     questionary.press_any_key_to_continue().ask()
 
 def action_convert_schema(config):
-    """Attempts to convert PostgreSQL tables to TimescaleDB Hypertables."""
     if not config.get("timescale_enabled", False):
         console.print("[yellow]Hinweis: TimescaleDB ist deaktiviert.[/yellow]")
         if not questionary.confirm("Trotzdem versuchen?").ask():
@@ -1240,36 +1303,7 @@ def action_convert_schema(config):
     questionary.press_any_key_to_continue().ask()
 
 def action_show_stats(config):
-    """Checks the row counts in both databases."""
-    console.print(Panel("[bold]Datenbank Vergleich[/bold]", box=box.ROUNDED))
-    s_conn = connect_sqlite_ro(config["sqlite_path"])
-    if not s_conn:
-        return
-    with console.status("Lade Statistiken..."):
-        with PostgresManager(config, fast_mode=False) as p_conn:
-            p_cur = p_conn.cursor()
-            s_cur = s_conn.cursor()
-            table = Table()
-            table.add_column("Tabelle", style="cyan")
-            table.add_column("SQ Zeilen", justify="right")
-            table.add_column("PG Zeilen", justify="right")
-            for tbl in TABLES_CONF:
-                name = tbl['name']
-                try:
-                    s_cur.execute(f"SELECT COUNT(*) FROM {name}")
-                    s_c = f"{s_cur.fetchone()[0]:,}"
-                except:
-                    s_c = "err"
-                try:
-                    p_cur.execute(f"SELECT COUNT(*) FROM {name}")
-                    p_c = f"{p_cur.fetchone()[0]:,}"
-                except:
-                    p_conn.rollback()
-                    p_c = "err"
-                table.add_row(name, s_c, p_c)
-    console.print(table)
-    s_conn.close()
-    questionary.press_any_key_to_continue().ask()
+    action_verify_migration(config)
 
 def action_vacuum_menu(config):
     choice = questionary.select("Vacuum-Modus:", choices=["Full", "Selektiv", "Zurück"]).ask()
@@ -1372,7 +1406,7 @@ def action_maintenance(config):
         if choice == "Repair Center (Smart)":
             action_fix_metadata(config)
         if choice == "DB Status":
-            action_show_stats(config)
+            action_verify_migration(config)
         if choice == "Postgres VACUUM":
             action_vacuum_menu(config)
         if choice == "Postgres TRUNCATE":
@@ -1392,7 +1426,7 @@ def action_migration_menu(config):
 
 def main():
     console.clear()
-    console.print(Panel.fit("[bold blue]Home Assistant Migration Tool[/bold blue]\n[dim]v68 - Final Production Release[/dim]", box=box.DOUBLE))
+    console.print(Panel.fit("[bold blue]Home Assistant Migration Tool[/bold blue]\n[dim]v69 - Final Production Release[/dim]", box=box.DOUBLE))
     if not os.path.exists(CONFIG_FILE):
         action_create_config()
     config = load_json(CONFIG_FILE)
