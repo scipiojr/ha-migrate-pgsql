@@ -1,117 +1,74 @@
-# Home Assistant Next-Gen Database Migrator (v10)
+# Home Assistant DB Migration Tool (SQLite -> PostgreSQL)
 
-[🇩🇪 Deutsch](#-dokumentation-deutsch) | [🇺🇸 English](#-english-documentation)
+Ein professionelles "Next-Gen" Skript zur Migration deiner Home Assistant Historie von der Standard-SQLite-Datenbank auf eine hochperformante PostgreSQL-Instanz.
 
----
+Es wurde speziell entwickelt, um häufige Probleme wie Foreign-Key-Fehler, Timeouts, "Database Locked"-Fehler und fehlende Historien im Energie-Dashboard ("Geister-Daten") zu vermeiden.
 
-## 🇩🇪 Dokumentation (Deutsch)
+**Version:** 68 (Production Grade)
 
-Ein hochmodernes, fehlertolerantes Tool zur Migration Ihrer Home Assistant Datenbank von SQLite zu PostgreSQL (inkl. TimescaleDB).
-Entwickelt für **große Datenbanken (10GB+)**, maximale Datensicherheit und Benutzerfreundlichkeit.
+## ✨ Hauptfunktionen
 
-### ✨ Features der v10 Edition
+* **🚀 High-Performance:** Nutzt Batch-Processing (`execute_values`) mit standardmäßig 10.000er Batches und einen speziellen `Fast Mode` (deaktiviert temporär Constraints), um Millionen von Datensätzen in Minuten statt Stunden zu importieren.
+* **🟢 Live-Start (Zero Downtime):** Die Migration ist strikt in zwei Phasen unterteilt. Nach Phase 1 (Metadaten) kannst du Home Assistant starten! Die riesige Historie wird im Hintergrund ("Backfill") importiert, während dein Smart Home schon wieder läuft.
+* **🔧 Smart Repair Center (Dual-Mode):** Behebt das bekannte Problem fehlender Daten im Energie-Dashboard (wenn HA neue IDs für Sensoren vergibt, z.B. `sensor.power_2`).
+    * Funktioniert sowohl auf der **PostgreSQL** (Ziel) als auch auf der **SQLite** (Quelle).
+    * Erkennt intelligente Suffixe (auch Mehrkanal-Sensoren wie `_1_2` werden korrekt zu `_1` zugeordnet).
+* **🧠 Global Layering Strategy:** Importiert Tabellen strikt nach Abhängigkeiten (Metadaten -> Zeiträume -> Nutzdaten), um Foreign-Key-Fehler zu verhindern.
+* **📈 TimescaleDB Support:** (Experimentell) Vorbereitet für TimescaleDB Hypertables, inklusive Sicherheitscheck (verhindert Absturz durch falsche Datentypen).
 
-* **Modernes UI:** Interaktive Menüs (Pfeiltasten), Checkboxen, farbige Fortschrittsbalken (basierend auf `Rich` & `Questionary`).
-* **Intelligente Typ-Konvertierung:** Erkennt automatisch Datentypen in Postgres und konvertiert SQLite-Daten passend (z.B. Datumsstrings in Timestamps, `0/1` in Booleans, Bereinigung von Null-Bytes).
-* **Crash-Safe (Resume):** Speichert den Fortschritt. Bei Abbruch macht das Tool exakt dort weiter, wo es aufgehört hat.
-* **Granularer Reset:** Sie können den Fortschritt für **einzelne Tabellen** zurücksetzen, falls Sie diese neu migrieren wollen.
-* **Live-Migration:** Home Assistant kann bereits die neue DB nutzen, während das Tool im Hintergrund die Historie importiert.
-* **Diagnose & Logging:** Detaillierte Fehlerprotokolle in `migration_errors.log` (inkl. SQL-Query und fehlerhaften Daten).
-* **TimescaleDB Ready:** Konvertiert Tabellen selektiv in Hypertables (~90% Platzersparnis).
+## 📋 Voraussetzungen
 
-### 📦 Installation
+* **Python 3.9+**
+* **PostgreSQL Server** (laufend, leer und erreichbar).
+* **Home Assistant** (muss für den Start der Migration gestoppt werden).
+* Die `home-assistant_v2.db` Datei (am besten lokal kopiert, um "Database Locked"-Fehler zu vermeiden).
 
-1.  **Voraussetzung:** Python 3.8 oder höher.
-2.  Installieren Sie die Abhängigkeiten:
+## 📦 Installation
 
-```bash
-pip install -r requirements.txt
-```
+1.  Repository klonen oder Dateien herunterladen.
+2.  Abhängigkeiten installieren:
+    ```bash
+    pip install -r requirements.txt
+    ```
 
-### 🚀 Der Migrations-Workflow
+## 🚀 Nutzung (Der "Live-Start" Workflow)
 
+### 1. Konfiguration
 Starten Sie das Tool:
 ```bash
-python migrate_ha_modern_v10.py
+python migrate_ha_modern_v68.py
 ```
+Ein Wizard führt durch die Einrichtung (Pfade, Passwörter). Dies wird in `config.json` gespeichert.
 
-#### Schritt 1: Setup
-Wählen Sie **[Konfiguration bearbeiten]**. Der Assistent führt Sie durch die Einrichtung und prüft die Verbindung.
+### 2. Phase 1: Metadaten (HA muss gestoppt sein!)
+* Wählen Sie **"Migration starten"** -> **"Alle Tabellen"**.
+* Das Skript migriert nun die "kleinen" Tabellen (`states_meta`, `event_types`, etc.). Das geht meist sehr schnell (wenige Sekunden bis Minuten).
 
-#### Schritt 2: Pre-Flight (WICHTIG!)
-*Bevor* Sie Home Assistant mit der neuen Postgres-Datenbank verbinden:
-1.  Gehen Sie zu **Wartung & Diagnose** -> **Sequenzen Reset**.
-2.  Das Tool setzt die IDs in Postgres hoch (auf `Max_SQLite_ID + 50000`), damit Home Assistant keine IDs vergibt, die später importiert werden sollen.
+### 3. Der Live-Start Moment
+Das Skript stoppt automatisch und zeigt eine **große grüne Meldung**.
+* Das Tool hat jetzt die Datenbank-Sequenzen (Auto-Increment) in Postgres hochgesetzt (auf Max-ID + 50.000).
+* **Aktion:** Konfigurieren Sie jetzt Ihren Home Assistant auf die Postgres-DB und **starten Sie Home Assistant**.
+* Home Assistant wird nun *neue* Daten in den "sicheren Bereich" (hohe IDs) schreiben.
+* Drücken Sie im Skript eine Taste, um fortzufahren.
 
-#### Schritt 3: Home Assistant umstellen
-Stoppen Sie HA, ändern Sie die `configuration.yaml` auf PostgreSQL und starten Sie HA neu.
-*HA schreibt nun neue Daten. Das Tool füllt die Lücke der Vergangenheit.*
+### 4. Phase 2: Historie (Hintergrund)
+* Das Skript migriert nun die riesigen Tabellen (`events`, `states`, `statistics`).
+* Dies geschieht parallel zum laufenden Home Assistant. Da das Skript *alte* IDs (niedrige Nummern) importiert, kommen sie sich nicht in die Quere.
 
-#### Schritt 4: Migration
-1.  Wählen Sie **Migration starten**.
-2.  Empfehlung: **Alle Tabellen migrieren**.
-3.  Das Tool arbeitet die Daten ab.
-    * *Konflikte:* Wenn Daten in Postgres schon existieren (wegen Schritt 3), werden diese übersprungen und im Status als "Skip" angezeigt.
-    * *Fehler:* Werden in `migration_errors.log` gespeichert.
+### 5. Nachbereitung & Repair
+Nach der Migration fehlen oft Daten im Energie-Dashboard, weil HA beim Starten neue IDs generiert hat.
+* Gehen Sie im Skript zu **"Wartung & Diagnose"** -> **"Repair Center (Smart)"**.
+* Wählen Sie **"PostgreSQL (Ziel)"**.
+* Führen Sie **"Suffixe (_2, _3...) (Smart Merge)"** aus.
+* Das Tool analysiert die DB, findet die Duplikate und führt die Historien zusammen.
 
-#### Schritt 5: Abschluss & Wartung
-* Prüfen Sie den Erfolg unter **Wartung & Diagnose** -> **DB Status Check**.
-* (Optional) Nutzen Sie **TimescaleDB Optimierung** für die Tabellen `statistics`, `statistics_short_term` etc.
-* Führen Sie am Ende **Postgres VACUUM** aus (im Wartungsmenü), um die DB-Performance zu optimieren.
+## ⚠️ Troubleshooting
 
----
+**Fehler: "server closed the connection unexpectedly"**
+Wenn dieser Fehler auftritt, ist das "Paket" von 10.000 Zeilen zu groß für Ihre Verbindung oder den Server-RAM.
+* Öffnen Sie die `config.json`.
+* Ändern Sie `"batch_size": 10000` auf einen kleineren Wert (z.B. `2000` oder `1000`).
+* Starten Sie das Skript neu (es macht genau dort weiter, wo es aufgehört hat).
 
-## 🇺🇸 English Documentation
-
-A state-of-the-art, fault-tolerant tool to migrate your Home Assistant database from SQLite to PostgreSQL (incl. TimescaleDB).
-Designed for **large databases (10GB+)**, maximum data safety, and ease of use.
-
-### ✨ v10 Features
-
-* **Modern UI:** Interactive menus (arrow keys), checkboxes, rich progress bars.
-* **Smart Type Conversion:** Automatically detects Postgres target types and converts SQLite data accordingly (e.g., date strings to timestamps, `0/1` to booleans, null-byte cleanup).
-* **Crash-Safe (Resume):** Saves progress. If interrupted, the tool resumes exactly where it left off.
-* **Granular Reset:** Reset progress for **individual tables** if you need to re-migrate specific parts.
-* **Live Migration:** HA can use the new DB while history is imported in the background.
-* **Diagnostics & Logging:** Detailed error logs in `migration_errors.log` (includes SQL query and data sample).
-* **TimescaleDB Ready:** Selectively converts tables to Hypertables (~90% disk space saving).
-
-### 📦 Installation
-
-1.  **Prerequisite:** Python 3.8+.
-2.  Install dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-### 🚀 Migration Workflow
-
-Run the tool:
-```bash
-python migrate_ha_modern_v10.py
-```
-
-#### Step 1: Setup
-Select **[Konfiguration bearbeiten]** (Edit Config). The wizard guides you through the setup.
-
-#### Step 2: Pre-Flight (CRITICAL!)
-*Before* connecting Home Assistant to the new Postgres database:
-1.  Go to **Wartung & Diagnose** (Maintenance) -> **Sequenzen Reset** (Sequence Reset).
-2.  The tool updates Postgres IDs to `Max_SQLite_ID + 50000` to prevent ID collisions with new data.
-
-#### Step 3: Switch Home Assistant
-Stop HA, update `configuration.yaml` to use PostgreSQL, and restart HA.
-*HA is now writing new data. The tool will fill the historical gap.*
-
-#### Step 4: Migration
-1.  Select **Migration starten**.
-2.  Recommended: **Alle Tabellen migrieren** (All Tables).
-3.  Sit back.
-    * *Conflicts:* Existing data (from Step 3) is skipped safely and shown as "Skip".
-    * *Errors:* Logged to `migration_errors.log`.
-
-#### Step 5: Finalize
-* Verify results in **Wartung & Diagnose** -> **DB Status Check**.
-* (Optional) Use **TimescaleDB Optimierung**.
-* Run **Postgres VACUUM** (in Maintenance menu) to optimize performance.
+## Lizenz
+MIT License

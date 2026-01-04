@@ -1,24 +1,52 @@
+"""
+Home Assistant Migration Tool (SQLite to PostgreSQL)
+Version: 68 (Production Grade + High Perf Batching + Refactored)
+Author: Gemini (AI)
+License: MIT
+
+DESCRIPTION:
+This tool migrates data from SQLite to PostgreSQL with a focus on data integrity.
+It handles quirks like Foreign Key dependencies and mixed data types.
+
+KEY FEATURES:
+1. Global Layering: Migrates metadata first to satisfy Foreign Keys.
+2. Fast Mode: Temporarily disables constraints for speed (if possible).
+3. Live-Start: Sets sequences early so HA can run during history import.
+4. Smart Repair: Dual-Mode repair center for SQLite and Postgres.
+5. Performance: Default batch size set to 10,000 for maximum throughput.
+"""
+
+import json
+import os
+import re
 import sqlite3
+import sys
+import time
+from datetime import datetime, timezone
+
 import psycopg2
 import psycopg2.extras
-from psycopg2.extras import execute_values
 from dateutil import parser as date_parser
-from datetime import datetime, timezone
-import sys
-import os
-import time
-import json
-import getpass
-
-# UI Bibliotheken
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+from psycopg2.extras import execute_values
 from rich import box
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
+from rich.table import Table
 import questionary
+from questionary import Choice
 
-# ================= KONFIGURATION =================
+# ==============================================================================
+# CONFIGURATION & CONSTANTS
+# ==============================================================================
+
 DEFAULT_CONFIG = {
     "sqlite_path": "home-assistant_v2.db",
     "pg_host": "localhost",
@@ -26,7 +54,7 @@ DEFAULT_CONFIG = {
     "pg_db": "homeassistant",
     "pg_user": "homeassistant",
     "pg_pass": "",
-    "batch_size": 10000,
+    "batch_size": 10000,  # High Performance Default
     "seq_buffer": 50000,
     "timescale_enabled": False
 }
@@ -38,38 +66,42 @@ SKIP_LOG_FILE = "migration_skipped.log"
 
 console = Console()
 
+# ==============================================================================
+# SCHEMA DEFINITIONS
+# ==============================================================================
+
 TABLES_CONF = [
+    # --- PHASE 1: Metadata (Level 0-2) ---
+    {"name": "schema_changes", "pk": "change_id"},
     {"name": "event_data", "pk": "data_id"},
     {"name": "event_types", "pk": "event_type_id"},
-    {"name": "events", "pk": "event_id", "time_col": "time_fired_ts"}, 
-    {"name": "recorder_runs", "pk": "run_id", "time_col": "start_ts"},
-    {"name": "state_attributes", "pk": "attributes_id"},
     {"name": "states_meta", "pk": "metadata_id"},
-    {"name": "states", "pk": "state_id", "time_col": "last_updated_ts", "drop_fk": ["states_old_state_id_fkey"]},
+    {"name": "state_attributes", "pk": "attributes_id"},
     {"name": "statistics_meta", "pk": "id"},
+    {"name": "recorder_runs", "pk": "run_id", "time_col": "start_ts"},
     {"name": "statistics_runs", "pk": "run_id", "time_col": "start_ts"},
+
+    # --- PHASE 2: Payload (Level 3) ---
+    {"name": "events", "pk": "event_id", "time_col": "time_fired_ts"},
+    {"name": "states", "pk": "state_id", "time_col": "last_updated_ts", "drop_fk": ["states_old_state_id_fkey"]},
     {"name": "statistics", "pk": "id", "time_col": "start_ts", "segment_by": "metadata_id"},
     {"name": "statistics_short_term", "pk": "id", "time_col": "start_ts", "segment_by": "metadata_id"},
-    {"name": "schema_changes", "pk": "change_id"},
 ]
 
-DEPENDENCIES = {
-    "events": ["event_data", "event_types"],
-    "states": ["states_meta", "state_attributes"],
-    "statistics": ["statistics_meta"],
-    "statistics_short_term": ["statistics_meta"],
-}
+# Tables that belong to Phase 2 (Live-Start capable)
+PHASE_2_TABLE_NAMES = ["events", "states", "statistics", "statistics_short_term"]
 
 TABLE_MAP = {t["name"]: t for t in TABLES_CONF}
 
-# ================= IO & UTILS =================
+# ==============================================================================
+# IO & UTILITIES
+# ==============================================================================
 
 def load_json(path):
     if os.path.exists(path):
         try:
             with open(path, 'r') as f:
-                data = json.load(f)
-                return data if data else {}
+                return json.load(f) or {}
         except:
             return {}
     return {}
@@ -92,8 +124,8 @@ def log_error_to_file(table_name, error_msg, sql_query, batch_sample):
         with open(ERROR_LOG_FILE, "a", encoding="utf-8", errors='replace') as f:
             f.write(f"[{timestamp}] FEHLER in Tabelle '{table_name}'\n")
             f.write(f"MELDUNG: {error_msg}\n")
-            f.write(f"SQL QUERY: {sql_query[:500] if sql_query else 'N/A'}...\n")
-            f.write("-" * 80 + "\n")
+            f.write(f"SQL QUERY: {sql_query[:500]}...\n")
+            f.write(f"{'-'*80}\n")
     except:
         pass
 
@@ -108,7 +140,7 @@ def condense_ids_to_ranges(id_list):
     ranges = []
     if not sorted_ids:
         return ranges
-    
+
     range_start = sorted_ids[0]
     prev_id = sorted_ids[0]
     
@@ -141,7 +173,7 @@ def log_skips_to_file(table_name, skipped_ids, reason="Duplicate Key"):
             f.write(f"[{timestamp}] {table_name}: Übersprungen {len(skipped_ids)} Zeilen.\n")
             f.write(f"  Grund: {reason}\n")
             f.write(f"  IDs: {range_str}\n")
-            f.write("-" * 40 + "\n")
+            f.write(f"{'-'*40}\n")
     except Exception as e:
         console.print(f"[red]Fehler beim Schreiben des Skip-Logs: {e}[/red]")
 
@@ -154,24 +186,63 @@ def format_bytes(size):
         n += 1
     return f"{size:.2f} {power_labels[n]}B"
 
-# ================= DB MANAGERS =================
+def format_ts(ts):
+    if not ts:
+        return "-"
+    try:
+        return datetime.fromtimestamp(ts).strftime("%d.%m.%y %H:%M")
+    except:
+        return str(ts)
+
+# ==============================================================================
+# DB CONNECTION MANAGERS
+# ==============================================================================
+
+def sqlite_regexp(expr, item):
+    """Python-based REGEXP function for SQLite."""
+    try:
+        reg = re.compile(expr)
+        return reg.search(item) is not None
+    except Exception:
+        return False
 
 class PostgresManager:
+    """Context manager for Postgres with Keepalive and Fast-Mode support."""
     def __init__(self, config, fast_mode=True):
         self.cfg = config
         self.fast_mode = fast_mode
         self.conn = None
+        self.fast_mode_active = False
 
     def __enter__(self):
         try:
             self.conn = psycopg2.connect(
-                host=self.cfg["pg_host"], port=self.cfg["pg_port"],
-                database=self.cfg["pg_db"], user=self.cfg["pg_user"], password=self.cfg["pg_pass"]
+                host=self.cfg["pg_host"],
+                port=self.cfg["pg_port"],
+                database=self.cfg["pg_db"],
+                user=self.cfg["pg_user"],
+                password=self.cfg["pg_pass"],
+                application_name="ha_migrator_v68",
+                connect_timeout=10,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=5
             )
             with self.conn.cursor() as cur:
                 cur.execute("SET TIME ZONE 'UTC';")
                 if self.fast_mode:
-                    cur.execute("SET session_replication_role = 'replica';")
+                    try:
+                        cur.execute("SET session_replication_role = 'replica';")
+                        self.fast_mode_active = True
+                    except psycopg2.errors.InsufficientPrivilege:
+                        self.conn.rollback()
+                        console.print("[yellow]WARNUNG: Keine Superuser-Rechte. Safe Mode aktiv.[/yellow]")
+                        self.fast_mode_active = False
+                    except Exception as e:
+                        self.conn.rollback()
+                        console.print(f"[red]Warnung: Konnte Fast-Mode nicht aktivieren: {e}[/red]")
+                        self.fast_mode_active = False
             self.conn.commit()
             return self.conn
         except Exception as e:
@@ -181,35 +252,73 @@ class PostgresManager:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.conn:
             try:
-                if self.fast_mode:
+                if self.fast_mode and self.fast_mode_active:
                     with self.conn.cursor() as cur:
                         cur.execute("SET session_replication_role = 'origin';")
                     self.conn.commit()
             except:
                 pass
-            self.conn.close()
+            try:
+                self.conn.close()
+            except:
+                pass
 
 def connect_sqlite_ro(path):
+    """Connect to SQLite in Read-Only mode."""
     if not os.path.exists(path):
         console.print(f"[bold red]FATAL: SQLite Datei fehlt:[/bold red] {path}")
         return None
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=300)
+        conn.row_factory = sqlite3.Row
+        return conn
     except:
+        # Fallback if URI mode fails on older systems
         conn = sqlite3.connect(path, timeout=300)
-    conn.row_factory = sqlite3.Row
-    return conn
+        conn.row_factory = sqlite3.Row
+        return conn
 
 def connect_sqlite_rw(path):
+    """Connect to SQLite in Read-Write mode (Maintenance)."""
     if not os.path.exists(path):
         console.print(f"[bold red]FATAL: SQLite Datei fehlt:[/bold red] {path}")
         return None
     try:
         conn = sqlite3.connect(path, timeout=600)
+        # Register REGEXP for repair functions
+        conn.create_function("REGEXP", 2, sqlite_regexp)
         return conn
     except Exception as e:
         console.print(f"[red]Fehler beim Öffnen von SQLite (RW): {e}[/red]")
         return None
+
+# ==============================================================================
+# DB HELPERS & ANALYTICS
+# ==============================================================================
+
+def check_postgres_schema_exists(config):
+    """Verifies that target tables actually exist in Postgres."""
+    with PostgresManager(config, fast_mode=False) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='public'")
+            tables = {row[0] for row in cur.fetchall()}
+    
+    missing = []
+    for t in TABLES_CONF:
+        if t['name'] not in tables:
+            missing.append(t['name'])
+    
+    if missing:
+        console.print(Panel(
+            "[bold red]CRITICAL: Ziel-Datenbank ist leer![/bold red]\n\n"
+            "PostgreSQL enthält noch keine Tabellen.\n"
+            "1. Starte Home Assistant kurz gegen diese DB.\n"
+            "2. Stoppe HA.\n"
+            "3. Starte dieses Skript erneut.",
+            title="Fehler: Schema fehlt", box=box.HEAVY, style="red"
+        ))
+        return False
+    return True
 
 def get_max_id(cursor, table, pk_col):
     try:
@@ -257,13 +366,14 @@ def get_extended_db_stats(p_cur, table_name, pk_col, s_max):
             p_cur.execute(f"SELECT MAX({pk_col}) FROM public.{table_name} WHERE {pk_col} < %s", (s_max,))
             res = p_cur.fetchone()[0]
             stats["resume"] = res if res else 0
-        if s_max > 0:
+            
             p_cur.execute(f"SELECT MIN({pk_col}) FROM public.{table_name} WHERE {pk_col} > %s", (s_max,))
-            res = p_cur.fetchone()[0]
-            stats["barrier"] = res
+            stats["barrier"] = p_cur.fetchone()[0]
+            
         p_cur.execute(f"SELECT MAX({pk_col}) FROM public.{table_name}")
         res = p_cur.fetchone()[0]
         stats["head"] = res if res else 0
+        
         p_cur.execute(f"SELECT pg_get_serial_sequence('public.{table_name}', '{pk_col}')")
         seq_res = p_cur.fetchone()
         if seq_res and seq_res[0]:
@@ -273,71 +383,75 @@ def get_extended_db_stats(p_cur, table_name, pk_col, s_max):
         pass
     return stats
 
-# ================= CORE LOGIC: CONVERTERS =================
+# ==============================================================================
+# TYPE CONVERTERS
+# ==============================================================================
 
 def _conv_noop(val):
     return val
 
 def _conv_bool(val):
-    if val is None: return None
-    if isinstance(val, int): return bool(val)
-    if isinstance(val, str): return val.lower() in ('true', '1', 't', 'y', 'yes')
+    if val is None:
+        return None
+    if isinstance(val, int):
+        return bool(val)
+    if isinstance(val, str):
+        return val.lower() in ('true', '1', 't', 'y', 'yes')
     return val
 
 def _conv_timestamp(val):
-    if val is None: return None
+    if val is None:
+        return None
     if isinstance(val, (int, float)):
-        try: return datetime.fromtimestamp(val, tz=timezone.utc)
-        except: return None
-    elif isinstance(val, str):
+        return datetime.fromtimestamp(val, tz=timezone.utc)
+    if isinstance(val, str):
         try:
             dt = date_parser.parse(val)
-            if dt.tzinfo is None: return dt.replace(tzinfo=timezone.utc)
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(timezone.utc)
-        except: return None
+        except:
+            return None
     return None
 
 def _conv_int(val):
-    if val is None: return None
-    if isinstance(val, float): return int(val)
+    if val is None:
+        return None
+    if isinstance(val, float):
+        return int(val)
     if isinstance(val, str):
-        try: return int(float(val))
-        except: return None
+        try:
+            return int(float(val))
+        except:
+            return None
     return val
 
 def _conv_str_clean(val):
-    if val is None: return None
+    if val is None:
+        return None
     s_val = str(val)
-    if '\0' in s_val: return s_val.replace('\0', '')
+    if '\0' in s_val:
+        return s_val.replace('\0', '')
     return s_val
 
 def get_converter_for_type(target_type):
     tt = target_type.lower()
-    if 'boolean' in tt: return _conv_bool
-    if 'timestamp' in tt or 'date' in tt: return _conv_timestamp
-    if 'int' in tt or 'serial' in tt: return _conv_int
-    if 'char' in tt or 'text' in tt: return _conv_str_clean
+    if 'boolean' in tt:
+        return _conv_bool
+    if 'timestamp' in tt or 'date' in tt:
+        return _conv_timestamp
+    if 'int' in tt or 'serial' in tt:
+        return _conv_int
+    if 'char' in tt or 'text' in tt:
+        return _conv_str_clean
     return _conv_noop
 
-def analyze_skips(p_cur, table_name, pk_col, batch_data, common_cols):
-    if not pk_col:
-        return []
-    try:
-        try:
-            pk_idx = common_cols.index(pk_col)
-        except ValueError:
-            return []
-        ids_in_batch = [row[pk_idx] for row in batch_data if row[pk_idx] is not None]
-        if not ids_in_batch:
-            return []
-        query = f"SELECT {pk_col} FROM public.{table_name} WHERE {pk_col} = ANY(%s)"
-        p_cur.execute(query, (ids_in_batch,))
-        return [r[0] for r in p_cur.fetchall()]
-    except Exception as e:
-        console.print(f"[red]Fehler bei Skip-Analyse: {e}[/red]")
-        return []
+# ==============================================================================
+# MIGRATION LOGIC
+# ==============================================================================
 
 def run_preflight_analysis(s_conn, p_conn, plan):
+    """Visualizes the gap between SQLite and Postgres state."""
     console.print(Panel("[bold]Pre-Flight: Gap-Analyse & Synchronisation[/bold]", box=box.ROUNDED))
     table = Table(box=box.SIMPLE)
     table.add_column("Tabelle", style="cyan")
@@ -362,30 +476,47 @@ def run_preflight_analysis(s_conn, p_conn, plan):
             action = "Full Scan"
             
             if pk_col:
-                try: s_max = get_max_id(s_cur, t_name, pk_col)
-                except: s_max = 0
+                try:
+                    s_max = get_max_id(s_cur, t_name, pk_col)
+                except:
+                    s_max = 0
+                
                 stats = get_extended_db_stats(p_cur, t_name, pk_col, s_max)
+                
                 file_start = progress_data.get(t_name, 0)
                 start_point = max(file_start, stats["resume"])
                 
-                if start_point >= s_max and s_max > 0: action = "[green]✅ Fertig[/green]"
-                elif start_point > 0: action = f"[yellow]⏩ {start_point:,}[/yellow]"
-                else: action = "[blue]▶️ 0[/blue]"
+                if start_point >= s_max and s_max > 0:
+                    action = "[green]✅ Fertig[/green]"
+                elif start_point > 0:
+                    action = f"[yellow]⏩ {start_point:,}[/yellow]"
+                else:
+                    action = "[blue]▶️ 0[/blue]"
                 
                 barrier_str = f"{stats['barrier']:,}" if stats['barrier'] else "-"
-                table.add_row(t_name, f"{s_max:,}", f"{stats['resume']:,}", barrier_str, f"{stats['head']:,}", f"{stats['seq']:,}", action)
+                
+                table.add_row(
+                    t_name, 
+                    f"{s_max:,}", 
+                    f"{stats['resume']:,}", 
+                    barrier_str,
+                    f"{stats['head']:,}",
+                    f"{stats['seq']:,}",
+                    action
+                )
             else:
                 table.add_row(t_name, "-", "-", "-", "-", "-", "Full Scan (No PK)")
 
     p_cur.close()
-    console.print(table); console.print("")
+    console.print(table)
+    console.print("")
 
 def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progress, task_id):
+    """Migrates a single table using batch processing."""
     table_name = tbl_conf['name']
     pk_col = tbl_conf.get('pk')
     
     batch_data = []
-    insert_sql = None
     
     s_cur = s_conn.cursor()
     try:
@@ -402,7 +533,7 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
 
     common_cols = [c for c in s_cols if c in col_types]
     if not common_cols:
-        return {"status": False, "msg": "No common columns"}
+        return {"status": False, "msg": "Keine gemeinsamen Spalten"}
 
     converters = [get_converter_for_type(col_types[c]) for c in common_cols]
 
@@ -415,14 +546,17 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
     conflict_sql = "ON CONFLICT DO NOTHING"
     insert_sql = f"INSERT INTO public.{table_name} ({', '.join(quoted_cols)}) VALUES %s {conflict_sql}"
     
-    if pk_col: insert_sql += f" RETURNING {pk_col}"
+    if pk_col:
+        insert_sql += f" RETURNING {pk_col}"
 
     saved_start_id = progress_map.get(table_name, 0)
     s_cur = s_conn.cursor()
-    
     rich_progress.update(task_id, description=f"[cyan]Analysiere {table_name}...", total=None)
     
-    total_rows_abs = 0; total_rows_todo = 0; max_src_id = 0; final_start_id = saved_start_id
+    total_rows_abs = 0
+    total_rows_todo = 0
+    max_src_id = 0
+    final_start_id = saved_start_id
     p_cur = p_conn.cursor()
 
     try:
@@ -432,42 +566,59 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
             max_src_id = get_max_id(s_cur, table_name, pk_col)
             if final_start_id == 0 and max_src_id > 0:
                 stats = get_extended_db_stats(p_cur, table_name, pk_col, max_src_id)
-                if stats["resume"] > 0: final_start_id = stats["resume"]
+                if stats["resume"] > 0:
+                    final_start_id = stats["resume"]
 
             if final_start_id > 0 and final_start_id < max_src_id:
                 s_cur.execute(f"SELECT COUNT(*) FROM {table_name} WHERE {pk_col} > ?", (final_start_id,))
                 total_rows_todo = s_cur.fetchone()[0]
-            elif final_start_id >= max_src_id and max_src_id > 0: total_rows_todo = 0
-            else: total_rows_todo = total_rows_abs
-        else: total_rows_todo = total_rows_abs
-    except: pass
+            elif final_start_id >= max_src_id and max_src_id > 0:
+                total_rows_todo = 0
+            else:
+                total_rows_todo = total_rows_abs
+        else:
+            total_rows_todo = total_rows_abs
+    except:
+        pass
 
     already_done_count = total_rows_abs - total_rows_todo
 
     if total_rows_todo == 0:
         rich_progress.update(task_id, description=f"[green]{table_name} (Komplett)", completed=100, total=100)
-        s_cur.close(); p_cur.close()
+        s_cur.close()
+        p_cur.close()
         return {"status": True, "total": total_rows_abs, "inserted": 0, "skipped": 0, "previously_done": already_done_count}
 
     rich_progress.update(task_id, description=f"[bold cyan]{table_name}", total=total_rows_todo, completed=0)
 
+    # Initial sequence update (only if not a phase 2 table being run in phase 1 context)
+    if pk_col and table_name not in PHASE_2_TABLE_NAMES:
+        update_sequence_if_needed(p_cur, table_name, pk_col, max_src_id, cfg['seq_buffer'])
+        p_conn.commit()
+
     curr_off = final_start_id
     batch_size = cfg["batch_size"]
-    stats_inserted = 0; stats_skipped = 0
+    stats_inserted = 0
+    stats_skipped = 0
+    
     pk_idx = -1
     if pk_col:
-        try: pk_idx = common_cols.index(pk_col)
-        except: pk_idx = -1
+        try:
+            pk_idx = common_cols.index(pk_col)
+        except:
+            pk_idx = -1
 
     try:
         while True:
+            # Batch Fetch
             if pk_col:
                 s_cur.execute(f"SELECT {', '.join(quoted_cols)} FROM {table_name} WHERE {pk_col} > ? AND {pk_col} <= ? ORDER BY {pk_col} ASC LIMIT ?", (curr_off, max_src_id, batch_size))
             else:
                 s_cur.execute(f"SELECT {', '.join(quoted_cols)} FROM {table_name} LIMIT ? OFFSET ?", (batch_size, curr_off))
 
             rows = s_cur.fetchall()
-            if not rows: break
+            if not rows:
+                break
 
             batch_data = []
             batch_ids = []
@@ -476,64 +627,509 @@ def migrate_single_table(s_conn, p_conn, tbl_conf, cfg, progress_map, rich_progr
             for row in rows:
                 clean_row = []
                 for i, val in enumerate(row):
-                    if val is not None: val = converters[i](val)
+                    if val is not None:
+                        val = converters[i](val)
                     clean_row.append(val)
                 batch_data.append(clean_row)
                 if pk_col:
                     last_id = row[pk_col]
-                    if pk_idx >= 0: batch_ids.append(clean_row[pk_idx])
+                    if pk_idx >= 0:
+                        batch_ids.append(clean_row[pk_idx])
 
+            # Batch Insert
             if pk_col:
                 try:
                     returned_rows = execute_values(p_cur, insert_sql, batch_data, page_size=batch_size, fetch=True)
                     inserted_ids_set = set(r[0] for r in returned_rows)
                     batch_inserted = len(inserted_ids_set)
-                except:
+                except Exception as e:
+                    # FALLBACK: If batch fails, try fallback without RETURNING or let exception handler catch it
+                    # If this is "server closed connection", it will be caught in the outer except block
                     insert_sql_fallback = insert_sql.replace(f" RETURNING {pk_col}", "")
                     execute_values(p_cur, insert_sql_fallback, batch_data, page_size=batch_size)
                     batch_inserted = p_cur.rowcount
                     inserted_ids_set = set()
 
-                if batch_inserted == 0 and p_cur.rowcount > 0: batch_inserted = p_cur.rowcount
+                if batch_inserted == 0 and p_cur.rowcount > 0:
+                    batch_inserted = p_cur.rowcount
+                
                 skipped_in_batch = len(batch_data) - batch_inserted
                 if skipped_in_batch > 0 and inserted_ids_set:
                     all_ids_set = set(batch_ids)
                     skipped_ids = list(all_ids_set - inserted_ids_set)
-                    if skipped_ids: log_skips_to_file(table_name, skipped_ids, reason="Konflikt: ID existiert bereits")
+                    if skipped_ids:
+                        log_skips_to_file(table_name, skipped_ids, reason="Konflikt: ID existiert bereits")
             else:
                 execute_values(p_cur, insert_sql, batch_data, page_size=batch_size)
                 batch_inserted = p_cur.rowcount
-                if batch_inserted < 0: batch_inserted = 0
+                if batch_inserted < 0:
+                    batch_inserted = 0
                 skipped_in_batch = len(batch_data) - batch_inserted
 
             stats_inserted += batch_inserted
             stats_skipped += skipped_in_batch
-            
             rich_progress.update(task_id, description=f"[bold cyan]{table_name}[/] [dim](+{stats_inserted} | Skip: {stats_skipped})[/]")
-
             p_conn.commit()
-            if pk_col: save_progress(table_name, last_id)
+            if pk_col:
+                save_progress(table_name, last_id)
             
             rich_progress.update(task_id, advance=len(rows))
             curr_off = last_id
-            if not pk_col: curr_off += len(rows)
+            if not pk_col:
+                curr_off += len(rows)
 
-        if pk_col:
+        # Final sequence check for non-phase-2 tables
+        if pk_col and table_name not in PHASE_2_TABLE_NAMES:
             update_sequence_if_needed(p_cur, table_name, pk_col, max_src_id, cfg['seq_buffer'])
             p_conn.commit()
 
         return {"status": True, "total": total_rows_abs, "inserted": stats_inserted, "skipped": stats_skipped, "previously_done": already_done_count}
 
     except Exception as e:
-        p_conn.rollback()
+        # Graceful handling of connection death
+        try:
+            p_conn.rollback()
+        except:
+            pass
+        
         log_error_to_file(table_name, str(e), insert_sql, batch_data)
+        
+        if "server closed the connection" in str(e) or "OperationalError" in str(e):
+            return {"status": False, "msg": f"Verbindung verloren bei Batch-Größe {batch_size}. Bitte Config ändern (z.B. 1000)."}
+            
         return {"status": False, "msg": str(e)}
     finally:
-        p_cur.close(); s_cur.close()
+        try:
+            p_cur.close()
+            s_cur.close()
+        except:
+            pass
 
-# ================= MENUS & ACTIONS =================
+def run_migration_plan(config, plan):
+    """Orchestrates the migration of multiple tables."""
+    if not check_postgres_schema_exists(config):
+        return
+
+    s_conn = connect_sqlite_ro(config["sqlite_path"])
+    if not s_conn:
+        return
+    with PostgresManager(config, fast_mode=False) as p_conn:
+        run_preflight_analysis(s_conn, p_conn, plan)
+    
+    # SPLIT PLAN INTO TWO PHASES
+    phase1_plan = [t for t in plan if t not in PHASE_2_TABLE_NAMES]
+    phase2_plan = [t for t in plan if t in PHASE_2_TABLE_NAMES]
+    
+    report_data = []
+    progress_data = load_json(PROGRESS_FILE)
+
+    # --- PHASE 1 ---
+    with PostgresManager(config, fast_mode=True) as p_conn:
+        if phase1_plan:
+            console.print(Panel("[bold]Phase 1: Metadaten & Strukturen[/bold]", style="blue"))
+            with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}"), BarColumn(), TaskProgressColumn(), TextColumn("•"), TimeRemainingColumn()) as rich_progress:
+                for t_name in phase1_plan:
+                    task_id = rich_progress.add_task(f"Warte auf {t_name}...", start=False)
+                    rich_progress.start_task(task_id)
+                    res = migrate_single_table(s_conn, p_conn, TABLE_MAP[t_name], config, progress_data, rich_progress, task_id)
+                    res["name"] = t_name
+                    report_data.append(res)
+                    if not res["status"]:
+                        console.print(f"[bold red]Abbruch bei {t_name}: {res['msg']}[/bold red]")
+                        return
+
+    # --- INTERMISSION: LIVE START ---
+    if phase2_plan:
+        console.print("")
+        console.print(Panel(
+            "[bold green]PHASE 1 ABGESCHLOSSEN![/bold green]\n\n"
+            "Das Skript wird nun die Datenbank-Sequenzen hochsetzen.\n"
+            "Danach können Sie [bold]Home Assistant starten[/bold].\n"
+            "HA wird neue Daten schreiben, während dieses Skript die Historie (Phase 2) im Hintergrund auffüllt.",
+            title="Ready for Live-Start", box=box.DOUBLE, style="green"
+        ))
+        
+        # Explicit Sequence Update for Phase 2 tables BEFORE allowing HA start
+        with console.status("Bereite Live-Start vor (Sequenzen update)..."):
+            with PostgresManager(config, fast_mode=False) as p_conn:
+                p_cur = p_conn.cursor()
+                s_cur = s_conn.cursor()
+                for t_name in phase2_plan:
+                    tbl = TABLE_MAP[t_name]
+                    if tbl.get('pk'):
+                        max_sq = get_max_id(s_cur, t_name, tbl['pk'])
+                        update_sequence_if_needed(p_cur, t_name, tbl['pk'], max_sq, config['seq_buffer'])
+                p_conn.commit()
+                p_cur.close()
+                s_cur.close()
+        
+        questionary.press_any_key_to_continue("Drücken Sie eine Taste, um Phase 2 (Historie) zu starten...").ask()
+
+    # --- PHASE 2 ---
+    with PostgresManager(config, fast_mode=True) as p_conn:
+        if phase2_plan:
+            console.print(Panel("[bold]Phase 2: Historische Daten (Backfill)[/bold]", style="blue"))
+            with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}"), BarColumn(), TaskProgressColumn(), TextColumn("•"), TimeRemainingColumn()) as rich_progress:
+                for t_name in phase2_plan:
+                    task_id = rich_progress.add_task(f"Warte auf {t_name}...", start=False)
+                    rich_progress.start_task(task_id)
+                    res = migrate_single_table(s_conn, p_conn, TABLE_MAP[t_name], config, progress_data, rich_progress, task_id)
+                    res["name"] = t_name
+                    report_data.append(res)
+                    if not res["status"]:
+                        console.print(f"[bold red]Abbruch bei {t_name}: {res['msg']}[/bold red]")
+                        break
+
+    s_conn.close()
+    
+    # Final Report
+    console.print("")
+    rpt = Table(title="Migration Report", box=box.SIMPLE)
+    rpt.add_column("Tabelle", style="cyan")
+    rpt.add_column("Status", style="bold")
+    rpt.add_column("Gesamt", justify="right")
+    rpt.add_column("Resume", style="dim", justify="right")
+    rpt.add_column("Neu", style="green", justify="right")
+    rpt.add_column("Skip", style="yellow", justify="right")
+    for i in report_data:
+        if i["status"]: 
+            rpt.add_row(i["name"], "[green]OK[/]", str(i["total"]), str(i["previously_done"]), str(i["inserted"]), str(i["skipped"]))
+        else: 
+            rpt.add_row(i["name"], "[red]FAIL[/]", "-", "-", "-", "-")
+    console.print(rpt)
+    
+    if any("statistics" in t for t in plan) and config.get("timescale_enabled", False):
+        if questionary.confirm("TimescaleDB Optimierung jetzt starten?").ask():
+            action_convert_schema(config)
+    else:
+        questionary.press_any_key_to_continue().ask()
+
+# ==============================================================================
+# REPAIR CENTER (SMART MERGE) - DUAL DB SUPPORT
+# ==============================================================================
+
+class DBRepairContext:
+    """Wrapper to handle different DB backends (SQLite vs Postgres) uniformly."""
+    def __init__(self, config, db_type):
+        self.config = config
+        self.db_type = db_type
+        self.conn = None
+        self.pg_mgr = None
+        
+    def __enter__(self):
+        if self.db_type == "postgres":
+            self.pg_mgr = PostgresManager(self.config, fast_mode=False)
+            self.conn = self.pg_mgr.__enter__()
+        else:
+            self.conn = connect_sqlite_rw(self.config["sqlite_path"])
+        return self.conn
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.db_type == "postgres":
+            self.pg_mgr.__exit__(exc_type, exc_val, exc_tb)
+        elif self.conn:
+            self.conn.close()
+
+def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="duplicates", db_type="postgres"):
+    """
+    Generic Repair Function: Finds conflicts, analyzes stats, and offers merge options.
+    Adaptable for both PostgreSQL and SQLite.
+    """
+    
+    # 1. Prepare Query based on DB Type and Repair Type
+    search_sql = ""
+    if db_type == "postgres":
+        if repair_type == "duplicates":
+            search_sql = """
+                SELECT statistic_id, jsonb_agg(id ORDER BY id ASC) as ids 
+                FROM statistics_meta 
+                GROUP BY statistic_id 
+                HAVING count(*) > 1;
+            """
+        elif repair_type == "suffixes":
+            # Uses jsonb_build_array/agg for Postgres compatibility
+            search_sql = r"""
+                SELECT 
+                    m1.statistic_id, 
+                    jsonb_build_array(m1.id) || jsonb_agg(m2.id)
+                FROM statistics_meta m1
+                JOIN statistics_meta m2 
+                    ON m2.statistic_id LIKE m1.statistic_id || '%\_%'
+                    AND m2.statistic_id ~ ('^' || replace(m1.statistic_id, '.', '\.') || '_\d+$')
+                GROUP BY m1.statistic_id, m1.id
+            """
+    else: # SQLite
+        if repair_type == "duplicates":
+            search_sql = """
+                SELECT statistic_id, json_group_array(id)
+                FROM statistics_meta
+                GROUP BY statistic_id
+                HAVING count(*) > 1;
+            """
+        elif repair_type == "suffixes":
+            # SQLite Regexp: Uses raw string to avoid syntax warning
+            search_sql = r"""
+                SELECT 
+                    m1.statistic_id, 
+                    json_group_array(m2.id)
+                FROM statistics_meta m1
+                JOIN statistics_meta m2 
+                    ON m2.statistic_id REGEXP ('^' || REPLACE(m1.statistic_id, '.', '\.') || '_\d+$')
+                    OR m2.id = m1.id
+                GROUP BY m1.statistic_id
+                HAVING count(*) > 1
+            """
+
+    with DBRepairContext(config, db_type) as conn:
+        cur = conn.cursor()
+        console.print(f"[cyan]{title} ({db_type.upper()})...[/cyan]")
+        
+        try:
+            cur.execute(search_sql)
+            candidates = cur.fetchall()
+        except Exception as e:
+            console.print(f"[red]Fehler bei der Suche: {e}[/red]")
+            return
+
+        if not candidates:
+            console.print("[green]Keine Probleme gefunden.[/green]")
+            return
+
+        conflicts = []
+        with console.status("Analysiere Daten-Historie..."):
+            for row in candidates:
+                if merge_mode:
+                    if db_type == "postgres":
+                        # Postgres returns list directly due to jsonb_agg
+                        if len(row) == 2:
+                            name = row[0]
+                            ids = row[1]
+                        else:
+                            continue
+                    else:
+                        # SQLite returns JSON string "[1, 2]"
+                        name = row[0]
+                        try:
+                            ids = json.loads(row[1])
+                        except:
+                            continue
+
+                    # Dedup IDs
+                    ids = sorted(list(set(ids)))
+
+                    stats = []
+                    for eid in ids:
+                        try:
+                            # Query works for both DBs (mostly standard SQL)
+                            q_lts = "SELECT COUNT(*), MIN(start_ts), MAX(start_ts) FROM statistics WHERE metadata_id = %s" if db_type == 'postgres' else "SELECT COUNT(*), MIN(start_ts), MAX(start_ts) FROM statistics WHERE metadata_id = ?"
+                            cur.execute(q_lts, (eid,))
+                            res_lts = cur.fetchone()
+                            
+                            q_st = "SELECT COUNT(*) FROM statistics_short_term WHERE metadata_id = %s" if db_type == 'postgres' else "SELECT COUNT(*) FROM statistics_short_term WHERE metadata_id = ?"
+                            cur.execute(q_st, (eid,))
+                            cnt_st = cur.fetchone()[0]
+                            
+                            # Handle None results
+                            rows = (res_lts[0] or 0) + (cnt_st or 0)
+                            min_ts = res_lts[1]
+                            max_ts = res_lts[2] or 0
+                            
+                            stats.append({
+                                "id": eid,
+                                "rows": rows,
+                                "min_ts": min_ts,
+                                "max_ts": max_ts
+                            })
+                        except Exception:
+                            stats.append({"id": eid, "rows": 0, "min_ts": 0, "max_ts": 0})
+                    
+                    # Sort: latest timestamp wins
+                    stats.sort(key=lambda x: x["max_ts"], reverse=True)
+                    
+                    if not stats: continue
+
+                    target = stats[0]
+                    sources = stats[1:]
+                    source_ids = [s["id"] for s in sources]
+                    
+                    conflicts.append({
+                        "name": name,
+                        "target_id": target["id"],
+                        "source_ids": source_ids,
+                        "target_stats": f"ID {target['id']}: {target['rows']} Zeilen ({format_ts(target['min_ts'])} - {format_ts(target['max_ts'])})",
+                        "source_stats": "\n".join([f"ID {s['id']}: {s['rows']} Zeilen ({format_ts(s['min_ts'])} - {format_ts(s['max_ts'])})" for s in sources])
+                    })
+
+        # Render Table
+        table = Table(title=f"Gefundene Konflikte: {len(conflicts)}", show_lines=True)
+        table.add_column("Sensor", style="cyan")
+        table.add_column("Merge", style="bold magenta")
+        table.add_column("Details (Ziel)", style="green")
+        table.add_column("Details (Quelle/Alt)", style="yellow")
+        
+        for c in conflicts:
+            table.add_row(
+                c["name"],
+                f"{c['source_ids']} -> {c['target_id']}",
+                c["target_stats"],
+                c["source_stats"]
+            )
+        console.print(table)
+        
+        if not questionary.confirm("Möchtest du diese Konflikte bearbeiten?").ask():
+            return
+
+        # Interactive Loop
+        with Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(), TaskProgressColumn()) as progress:
+            task = progress.add_task("Bearbeite...", total=len(conflicts))
+            
+            for c in conflicts:
+                progress.stop() 
+                console.print(f"\n[bold]{c['name']}[/bold] (Merge {c['source_ids']} -> {c['target_id']})")
+                
+                action = questionary.select(
+                    "Aktion:",
+                    choices=[
+                        Choice("Merge durchführen", value="merge"),
+                        Choice("Ziel-ID ändern", value="edit"),
+                        Choice("Skip", value="skip")
+                    ]
+                ).ask()
+                
+                progress.start()
+                
+                target_id = c["target_id"]
+                
+                if action == "skip":
+                    progress.advance(task)
+                    continue
+                
+                if action == "edit":
+                    target_id = int(questionary.text("Neue Ziel-ID:", default=str(target_id)).ask())
+                
+                try:
+                    # Execute Merge
+                    # Syntax differs significantly for array/list params
+                    
+                    if db_type == "postgres":
+                        cur.execute(f"UPDATE statistics SET metadata_id = {target_id} WHERE metadata_id = ANY(%s)", (c['source_ids'],))
+                        cur.execute(f"UPDATE statistics_short_term SET metadata_id = {target_id} WHERE metadata_id = ANY(%s)", (c['source_ids'],))
+                        cur.execute(f"DELETE FROM statistics_meta WHERE id = ANY(%s)", (c['source_ids'],))
+                    else: # SQLite (No ANY(), use IN (?,?,?))
+                        # Helper for placeholders
+                        placeholders = ','.join('?' * len(c['source_ids']))
+                        
+                        cur.execute(f"UPDATE statistics SET metadata_id = ? WHERE metadata_id IN ({placeholders})", [target_id] + c['source_ids'])
+                        cur.execute(f"UPDATE statistics_short_term SET metadata_id = ? WHERE metadata_id IN ({placeholders})", [target_id] + c['source_ids'])
+                        cur.execute(f"DELETE FROM statistics_meta WHERE id IN ({placeholders})", c['source_ids'])
+
+                    conn.commit()
+                    console.print(f"[green]✓ {c['name']} gemerged.[/green]")
+                except Exception as e:
+                    conn.rollback()
+                    console.print(f"[red]✗ Fehler: {e}[/red]")
+                
+                progress.advance(task)
+
+def fix_duplicates_smart(config, db_type):
+    analyze_and_fix_interactive(config, "Suche exakte Duplikate", merge_mode=True, repair_type="duplicates", db_type=db_type)
+
+def fix_suffixes_smart(config, db_type):
+    analyze_and_fix_interactive(config, "Suche Suffixe (_2, _3...)", merge_mode=True, repair_type="suffixes", db_type=db_type)
+
+def fix_missing_units_interactive(config):
+    """Finds statistics with missing Units (NULL) and offers heuristics. (Postgres Only for now)"""
+    with PostgresManager(config, fast_mode=False) as p_conn:
+        cur = p_conn.cursor()
+        console.print("[cyan]Suche nach fehlenden Einheiten (NULL) [Postgres]...[/cyan]")
+        
+        rules = [
+            ("%_energy%", "kWh"), ("%_consumption%", "kWh"), ("%_power%", "W"),
+            ("%_temperature%", "°C"), ("%_humidity%", "%"), ("%_battery%", "%"),
+            ("%_voltage%", "V"), ("%_current%", "A")
+        ]
+        
+        candidates = []
+        for pattern, unit in rules:
+            cur.execute("SELECT id, statistic_id FROM statistics_meta WHERE unit_of_measurement IS NULL AND statistic_id LIKE %s", (pattern,))
+            for r in cur.fetchall():
+                candidates.append({"id": r[0], "name": r[1], "new_unit": unit})
+        
+        if not candidates:
+            console.print("[green]Keine fehlenden Einheiten gefunden.[/green]")
+            return
+
+        choices = [Choice(f"{c['name']} -> Setze '{c['new_unit']}'", value=c, checked=True) for c in candidates]
+        selected = questionary.checkbox("Wähle Einheiten:", choices=choices).ask()
+        
+        if not selected:
+            return
+
+        action = questionary.select(
+            f"{len(selected)} Einträge ausgewählt. Wie verfahren?",
+            choices=["Direkt anwenden", "Einzeln prüfen", "Abbrechen"]
+        ).ask()
+
+        if action == "Abbrechen":
+            return
+
+        final_list = selected
+        if "Einzeln" in action:
+            final_list = []
+            for item in selected:
+                console.print(f"\n[bold]{item['name']}[/bold]")
+                d = questionary.select(f"Vorschlag: {item['new_unit']}", choices=[Choice("OK", value="accept"), Choice("Edit", value="edit"), Choice("Skip", value="skip")]).ask()
+                if d == "skip": continue
+                if d == "edit": item['new_unit'] = questionary.text("Einheit:", default=item['new_unit']).ask()
+                final_list.append(item)
+
+        with Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(), TaskProgressColumn()) as progress:
+            task = progress.add_task("Update...", total=len(final_list))
+            for c in final_list:
+                progress.update(task, description=f"Fixing {c['name']}...")
+                try:
+                    cur.execute("UPDATE statistics_meta SET unit_of_measurement = %s WHERE id = %s", (c['new_unit'], c['id']))
+                    p_conn.commit()
+                except:
+                    p_conn.rollback()
+                progress.advance(task)
+        console.print("[green]Fertig.[/green]")
+
+def action_fix_metadata(config):
+    """Repair Center Menu."""
+    console.print(Panel("[bold]Repair Center: Statistik & Metadaten (Smart)[/bold]", box=box.ROUNDED))
+    
+    # Select DB Target
+    db_target = questionary.select("Datenbank-Ziel:", choices=[
+        Choice("PostgreSQL (Ziel)", value="postgres"),
+        Choice("SQLite (Quelle)", value="sqlite"),
+        "Zurück"
+    ]).ask()
+    
+    if db_target == "Zurück":
+        return
+
+    while True:
+        mode = questionary.select(f"Kategorie wählen ({db_target.upper()}):", choices=["Exakte Duplikate (Smart Merge)", "Suffixe (_2, _3...) (Smart Merge)", "Fehlende Einheiten (Units, PG only)", "Zurück"]).ask()
+        if mode == "Zurück":
+            return
+        if "Duplikate" in mode:
+            fix_duplicates_smart(config, db_target)
+        elif "Suffixe" in mode:
+            fix_suffixes_smart(config, db_target)
+        elif "Einheiten" in mode:
+            if db_target == "sqlite":
+                console.print("[yellow]Unit-Fixing currently implemented for Postgres only.[/yellow]")
+            else:
+                fix_missing_units_interactive(config)
+        console.print("")
+
+# ==============================================================================
+# ACTIONS & MENUS
+# ==============================================================================
 
 def action_create_config():
+    """Interactive wizard to generate the config.json file."""
     console.print(Panel("[bold]Konfiguration erstellen[/bold]", box=box.ROUNDED))
     current = load_json(CONFIG_FILE) or DEFAULT_CONFIG.copy()
     config = {}
@@ -549,319 +1145,276 @@ def action_create_config():
     save_json(CONFIG_FILE, config)
     console.print(f"[green]Konfiguration gespeichert in {CONFIG_FILE}[/green]")
     questionary.press_any_key_to_continue().ask()
+    return config
 
 def action_reset_progress():
-    console.print(Panel("[bold]Fortschritt zurücksetzen[/bold]", box=box.ROUNDED))
+    """Menu to delete progress file (Full or Partial)."""
     data = load_json(PROGRESS_FILE)
     if not data:
-        console.print("[yellow]Keine Fortschrittsdaten gefunden.[/yellow]"); questionary.press_any_key_to_continue().ask(); return
-    choice = questionary.select("Was möchten Sie zurücksetzen?", choices=["Alles zurücksetzen", "Einzelne Tabellen", "Abbrechen"]).ask()
-    if choice == "Abbrechen": return
-    if choice.startswith("Alles"):
-        try: os.remove(PROGRESS_FILE); console.print("[green]Alles zurückgesetzt.[/green]")
-        except Exception as e: console.print(f"[red]Fehler: {e}[/red]")
-    elif choice.startswith("Einzelne"):
-        selected = questionary.checkbox("Welche Tabellen?", choices=[questionary.Choice(k) for k in data.keys()]).ask()
-        if selected:
-            for t in selected: 
-                if t in data: del data[t]
-            save_json(PROGRESS_FILE, data); console.print(f"[green]{len(selected)} Tabellen zurückgesetzt.[/green]")
+        console.print("[yellow]Keine Daten.[/yellow]")
+        questionary.press_any_key_to_continue().ask()
+        return
+    choice = questionary.select("Was zurücksetzen?", choices=["Alles", "Einzeln", "Abbrechen"]).ask()
+    if choice == "Abbrechen":
+        return
+    if choice == "Alles":
+        os.remove(PROGRESS_FILE)
+        console.print("[green]Alles zurückgesetzt.[/green]")
+    elif choice == "Einzeln":
+        sel = questionary.checkbox("Tabellen:", choices=[questionary.Choice(k) for k in data.keys()]).ask()
+        if sel:
+            for t in sel:
+                del data[t]
+            save_json(PROGRESS_FILE, data)
+            console.print(f"[green]{len(sel)} Tabellen zurückgesetzt.[/green]")
     questionary.press_any_key_to_continue().ask()
 
 def action_sequence_reset(config):
+    """Manually resets PostgreSQL sequences."""
     console.print(Panel("[bold]Pre-Flight Check: Sequenzen[/bold]", box=box.ROUNDED))
     s_conn = connect_sqlite_ro(config["sqlite_path"])
-    if not s_conn: return
+    if not s_conn:
+        return
     with console.status("[bold green]Verbinde mit Postgres...") as status:
         with PostgresManager(config, fast_mode=False) as p_conn:
             p_cur = p_conn.cursor()
-            table = Table(box=box.SIMPLE); table.add_column("Tabelle", style="cyan"); table.add_column("Status", style="magenta")
+            table = Table(box=box.SIMPLE)
+            table.add_column("Tabelle", style="cyan")
+            table.add_column("Status", style="magenta")
             for tbl in TABLES_CONF:
-                name = tbl['name']; pk = tbl.get('pk')
-                if not pk: continue
+                name = tbl['name']
+                pk = tbl.get('pk')
+                if not pk:
+                    continue
                 max_sqlite = get_max_id(s_conn.cursor(), name, pk)
                 updated, curr, target = update_sequence_if_needed(p_cur, name, pk, max_sqlite, config['seq_buffer'])
-                if updated: table.add_row(name, f"UPDATE: {curr} -> {target}"); p_conn.commit()
-                else: table.add_row(name, f"OK ({curr} > {target})")
+                table.add_row(name, f"UPDATE: {curr} -> {target}" if updated else f"OK ({curr} > {target})")
             p_cur.close()
-    console.print(table); s_conn.close(); questionary.press_any_key_to_continue().ask()
+    console.print(table)
+    s_conn.close()
+    questionary.press_any_key_to_continue().ask()
 
 def action_convert_schema(config):
+    """Attempts to convert PostgreSQL tables to TimescaleDB Hypertables."""
+    if not config.get("timescale_enabled", False):
+        console.print("[yellow]Hinweis: TimescaleDB ist deaktiviert.[/yellow]")
+        if not questionary.confirm("Trotzdem versuchen?").ask():
+            return
     console.print(Panel("[bold]TimescaleDB Konvertierung[/bold]", box=box.ROUNDED))
-    choices = [questionary.Choice(t['name'], value=t) for t in TABLES_CONF if "time_col" in t]
-    targets = questionary.checkbox("Wähle Tabellen:", choices=choices).ask()
-    if not targets: return
+    targets = questionary.checkbox("Wähle Tabellen:", choices=[questionary.Choice(t['name'], value=t) for t in TABLES_CONF if "time_col" in t]).ask()
+    if not targets:
+        return
     if any(t['name'] == 'states' for t in targets):
-        console.print("[bold yellow]WARNUNG: 'states' gewählt. Foreign Keys werden gelöscht.[/bold yellow]")
-        if not questionary.confirm("Fortfahren?").ask(): return
+        if not questionary.confirm("[bold yellow]WARNUNG: 'states' Foreign Keys werden gelöscht. Fortfahren?[/bold yellow]").ask():
+            return
     with PostgresManager(config, fast_mode=False) as p_conn:
         c = p_conn.cursor()
         with Progress(SpinnerColumn(), TextColumn("{task.description}"), transient=True) as progress:
             task = progress.add_task("Verarbeite...", total=len(targets))
             for tbl in targets:
-                name = tbl['name']; time_col = tbl['time_col']
+                name = tbl['name']
+                time_col = tbl['time_col']
                 progress.update(task, description=f"Prüfe {name}...")
-                
-                # --- AUTO-CLEANUP v32/33/35 ---
                 try:
-                    c.execute(f"SELECT COUNT(*) FROM {name} WHERE {time_col} IS NULL;")
-                    null_count = c.fetchone()[0]
-                    if null_count > 0:
-                        progress.update(task, description=f"Lösche {null_count} defekte Zeilen (NULL {time_col})...")
-                        c.execute(f"DELETE FROM {name} WHERE {time_col} IS NULL;")
-                        p_conn.commit()
-                except: pass
-
-                # --- SAFETY CHECK v35 ---
-                # Wenn Spalte DOUBLE PRECISION ist, darf NICHT zu Hypertable konvertiert werden!
-                try:
+                    c.execute(f"DELETE FROM {name} WHERE {time_col} IS NULL;") # Clean NULLs
                     c.execute("SELECT data_type FROM information_schema.columns WHERE table_name=%s AND column_name=%s", (name, time_col))
-                    col_type = c.fetchone()[0].lower()
-                    if "double" in col_type or "float" in col_type:
-                        console.print(f"[bold red]WARNUNG:[/bold red] Tabelle {name} verwendet FLOAT für {time_col}.")
-                        console.print("   TimescaleDB benötigt TIMESTAMP, aber Home Assistant benötigt FLOAT.")
-                        console.print("   [yellow]Überspringe Konvertierung, um Home Assistant nicht zu beschädigen.[/yellow]")
+                    if "double" in c.fetchone()[0].lower():
+                        console.print(f"[red]Skip {name}: Column {time_col} is FLOAT (Needs TIMESTAMP).[/red]")
                         progress.advance(task)
                         continue
-                except: pass
-
-                # --- CONVERSION ---
-                progress.update(task, description=f"Konvertiere {name}...")
-                try:
+                    # Conversion Logic
                     if "drop_fk" in tbl:
                         for fk in tbl["drop_fk"]:
-                            try: c.execute(f"SAVEPOINT drop_fk_{fk}"); c.execute(f"ALTER TABLE {name} DROP CONSTRAINT IF EXISTS {fk};"); c.execute(f"RELEASE SAVEPOINT drop_fk_{fk}")
-                            except: c.execute(f"ROLLBACK TO SAVEPOINT drop_fk_{fk}")
-                    try: c.execute(f"SAVEPOINT drop_pk_{name}"); c.execute(f"ALTER TABLE {name} DROP CONSTRAINT {name}_pkey CASCADE;"); c.execute(f"RELEASE SAVEPOINT drop_pk_{name}")
-                    except: c.execute(f"ROLLBACK TO SAVEPOINT drop_pk_{name}")
-
+                            c.execute(f"ALTER TABLE {name} DROP CONSTRAINT IF EXISTS {fk};")
+                    c.execute(f"ALTER TABLE {name} DROP CONSTRAINT {name}_pkey CASCADE;")
                     c.execute(f"ALTER TABLE {name} ADD PRIMARY KEY ({tbl['pk']}, {tbl['time_col']});")
-                    c.execute(f"SELECT create_hypertable('{name}', '{tbl['time_col']}', chunk_time_interval => INTERVAL '7 days', if_not_exists => TRUE, migrate_data => TRUE);")
-                    if "segment_by" in tbl: c.execute(f"ALTER TABLE {name} SET (timescaledb.compress, timescaledb.compress_segmentby = '{tbl['segment_by']}');")
-                    else: c.execute(f"ALTER TABLE {name} SET (timescaledb.compress);")
+                    c.execute(f"SELECT create_hypertable('{name}', '{time_col}', chunk_time_interval => INTERVAL '7 days', if_not_exists => TRUE, migrate_data => TRUE);")
+                    c.execute(f"ALTER TABLE {name} SET (timescaledb.compress);")
                     c.execute(f"SELECT add_compression_policy('{name}', INTERVAL '14 days');")
-                    
-                    p_conn.commit(); console.print(f"[green]✓ {name} konvertiert[/green]")
+                    p_conn.commit()
+                    console.print(f"[green]✓ {name} konvertiert[/green]")
                 except Exception as e:
-                    p_conn.rollback(); console.print(f"[red]✗ {name}: {e}[/red]")
+                    p_conn.rollback()
+                    console.print(f"[red]✗ {name}: {e}[/red]")
                 progress.advance(task)
     questionary.press_any_key_to_continue().ask()
 
-def run_migration_plan(config, plan):
-    s_conn = connect_sqlite_ro(config["sqlite_path"])
-    if not s_conn: return
-    with PostgresManager(config, fast_mode=False) as p_conn: run_preflight_analysis(s_conn, p_conn, plan)
-    report_data = []
-    with PostgresManager(config, fast_mode=True) as p_conn:
-        progress_data = load_json(PROGRESS_FILE)
-        rich_progress = Progress(
-            SpinnerColumn(), TextColumn("[bold blue]{task.description}"), BarColumn(),
-            TaskProgressColumn(), TextColumn("•"), TimeRemainingColumn(), TextColumn("• {task.completed}/{task.total}")
-        )
-        with rich_progress:
-            for t_name in plan:
-                task_id = rich_progress.add_task(f"Warte auf {t_name}...", start=False)
-                rich_progress.start_task(task_id)
-                res = migrate_single_table(s_conn, p_conn, TABLE_MAP[t_name], config, progress_data, rich_progress, task_id)
-                if res["status"]: res["name"] = t_name; report_data.append(res)
-                else:
-                    report_data.append({"name": t_name, "status": False, "msg": res["msg"]})
-                    console.print(f"[bold red]Abbruch bei {t_name}: {res['msg']}[/bold red]"); break
-    s_conn.close()
-    console.print("")
-    rpt = Table(title="Migration Report", box=box.SIMPLE)
-    rpt.add_column("Tabelle", style="cyan"); rpt.add_column("Status", style="bold")
-    rpt.add_column("Gesamt", justify="right"); rpt.add_column("Resume", style="dim", justify="right")
-    rpt.add_column("Neu", style="green", justify="right"); rpt.add_column("Skip", style="yellow", justify="right")
-    for i in report_data:
-        if i["status"]: rpt.add_row(i["name"], "[green]OK[/]", str(i["total"]), str(i["previously_done"]), str(i["inserted"]), str(i["skipped"]))
-        else: rpt.add_row(i["name"], "[red]FAIL[/]", "-", "-", "-", "-")
-    console.print(rpt)
-    if any("statistics" in t for t in plan) and config["timescale_enabled"]:
-        if questionary.confirm("TimescaleDB Optimierung jetzt starten?").ask(): action_convert_schema(config)
-    else: questionary.press_any_key_to_continue().ask()
-
-def action_migration_menu(config):
-    choice = questionary.select("Migrationstyp wählen:", choices=["Alle Tabellen migrieren", "Selektive Auswahl", "Zurück"]).ask()
-    if choice == "Zurück": return
-    target_plan = []
-    if choice.startswith("Alle"): target_plan = [t['name'] for t in TABLES_CONF]
-    else:
-        choices = [questionary.Choice(t['name']) for t in TABLES_CONF]
-        target_plan = questionary.checkbox("Wähle Tabellen:", choices=choices).ask()
-        if not target_plan: return
-        selected_set = set(target_plan); missing = set()
-        for t in target_plan:
-            if t in DEPENDENCIES:
-                for p in DEPENDENCIES[t]:
-                    if p not in selected_set: missing.add(p)
-        if missing:
-            console.print(f"[yellow]Warnung: Fehlende Eltern-Tabellen:[/yellow] {', '.join(missing)}")
-            opt = questionary.select("Wie verfahren?", choices=["Fehlende hinzufügen", "Ignorieren", "Abbruch"]).ask()
-            if opt == "Abbruch": return
-            if opt.startswith("Fehlende"): combined = selected_set | missing; target_plan = [t['name'] for t in TABLES_CONF if t['name'] in combined]
-    run_migration_plan(config, target_plan)
-
 def action_show_stats(config):
+    """Checks the row counts in both databases."""
     console.print(Panel("[bold]Datenbank Vergleich[/bold]", box=box.ROUNDED))
     s_conn = connect_sqlite_ro(config["sqlite_path"])
-    if not s_conn: return
+    if not s_conn:
+        return
     with console.status("Lade Statistiken..."):
         with PostgresManager(config, fast_mode=False) as p_conn:
-            p_cur = p_conn.cursor(); s_cur = s_conn.cursor()
-            try: s_size = os.path.getsize(config["sqlite_path"]); p_cur.execute("SELECT pg_database_size(current_database());"); p_size = p_cur.fetchone()[0]
-            except: s_size=0; p_size=0
-            table = Table(title=f"Größe: SQLite {format_bytes(s_size)} vs Postgres {format_bytes(p_size)}")
-            table.add_column("Tabelle", style="cyan"); table.add_column("Zeilen (SQLite)", justify="right"); table.add_column("Zeilen (PG)", justify="right"); table.add_column("Timescale?", justify="center")
+            p_cur = p_conn.cursor()
+            s_cur = s_conn.cursor()
+            table = Table()
+            table.add_column("Tabelle", style="cyan")
+            table.add_column("SQ Zeilen", justify="right")
+            table.add_column("PG Zeilen", justify="right")
             for tbl in TABLES_CONF:
                 name = tbl['name']
-                try: s_cur.execute(f"SELECT COUNT(*) FROM {name}"); s_c = f"{s_cur.fetchone()[0]:,}"
-                except Exception as e: s_c = str(e)
                 try:
-                    p_cur.execute(f"SELECT COUNT(*) FROM {name}"); p_c = f"{p_cur.fetchone()[0]:,}"
-                    p_cur.execute("SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name=%s", (name,)); ts = "✅" if p_cur.fetchone() else "-"
-                except: p_c = "err"; ts = "?"
-                table.add_row(name, s_c, p_c, ts)
-    console.print(table); s_conn.close(); questionary.press_any_key_to_continue().ask()
+                    s_cur.execute(f"SELECT COUNT(*) FROM {name}")
+                    s_c = f"{s_cur.fetchone()[0]:,}"
+                except:
+                    s_c = "err"
+                try:
+                    p_cur.execute(f"SELECT COUNT(*) FROM {name}")
+                    p_c = f"{p_cur.fetchone()[0]:,}"
+                except:
+                    p_conn.rollback()
+                    p_c = "err"
+                table.add_row(name, s_c, p_c)
+    console.print(table)
+    s_conn.close()
+    questionary.press_any_key_to_continue().ask()
 
 def action_vacuum_menu(config):
-    choice = questionary.select("Vacuum-Modus:", choices=["Ganze Datenbank (Full)", "Selektive Tabellen", "Zurück"]).ask()
-    if choice == "Zurück": return
-    if "Full" in choice:
-        if questionary.confirm("Vollständiges VACUUM ANALYZE starten? (Kann lange dauern)").ask():
-            try:
-                conn = psycopg2.connect(host=config["pg_host"], port=config["pg_port"], database=config["pg_db"], user=config["pg_user"], password=config["pg_pass"])
-                conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
-                cur = conn.cursor()
-                with console.status("Führe VACUUM ANALYZE (Full) aus..."): cur.execute("VACUUM ANALYZE;")
-                console.print("[green]Fertig.[/green]"); conn.close()
-            except Exception as e: console.print(f"[red]Fehler: {e}[/red]")
+    choice = questionary.select("Vacuum-Modus:", choices=["Full", "Selektiv", "Zurück"]).ask()
+    if choice == "Zurück":
+        return
+    conn = psycopg2.connect(host=config["pg_host"], port=config["pg_port"], database=config["pg_db"], user=config["pg_user"], password=config["pg_pass"])
+    conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+    cur = conn.cursor()
+    if choice == "Full":
+        if questionary.confirm("Starten?").ask():
+            with console.status("Running VACUUM FULL..."):
+                cur.execute("VACUUM ANALYZE;")
     else:
-        choices = [questionary.Choice(t['name']) for t in TABLES_CONF]
-        selected = questionary.checkbox("Tabellen wählen:", choices=choices).ask()
-        if selected:
-            try:
-                conn = psycopg2.connect(host=config["pg_host"], port=config["pg_port"], database=config["pg_db"], user=config["pg_user"], password=config["pg_pass"])
-                conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
-                cur = conn.cursor()
-                with Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(), TaskProgressColumn()) as progress:
-                    task = progress.add_task("Vacuum...", total=len(selected))
-                    for t in selected:
-                        progress.update(task, description=f"Vacuum {t}...")
-                        try: cur.execute(f"VACUUM ANALYZE public.{t};")
-                        except Exception as e: console.print(f"[red]Fehler bei {t}: {e}[/red]")
-                        progress.advance(task)
-                console.print("[green]Fertig.[/green]"); conn.close()
-            except Exception as e: console.print(f"[red]Verbindungsfehler: {e}[/red]")
+        sel = questionary.checkbox("Tabellen:", choices=[questionary.Choice(t['name']) for t in TABLES_CONF]).ask()
+        if sel:
+            for t in sel: 
+                with console.status(f"Vacuum {t}..."):
+                    cur.execute(f"VACUUM ANALYZE public.{t};")
+    conn.close()
+    console.print("[green]Fertig.[/green]")
+    questionary.press_any_key_to_continue().ask()
+
+def action_truncate_menu(config):
+    targets = questionary.checkbox("Tabellen leeren (TRUNCATE):", choices=[questionary.Choice(t['name']) for t in TABLES_CONF]).ask()
+    if not targets or not questionary.confirm(f"WARNUNG: Lösche {len(targets)} Tabellen unwiderruflich. Sicher?", default=False).ask():
+        return
+    with PostgresManager(config, fast_mode=False) as p_conn:
+        cur = p_conn.cursor()
+        try:
+            cur.execute(f"TRUNCATE TABLE {', '.join([f'public.{t}' for t in targets])} CASCADE;")
+            p_conn.commit()
+            console.print("[green]Geleert.[/green]")
+            # Cleanup Progress
+            data = load_json(PROGRESS_FILE)
+            for t in targets: 
+                if t in data:
+                    del data[t]
+            save_json(PROGRESS_FILE, data)
+        except Exception as e:
+            p_conn.rollback()
+            console.print(f"[red]Fehler: {e}[/red]")
     questionary.press_any_key_to_continue().ask()
 
 def action_sqlite_maintenance(config):
     console.print(Panel("[bold]SQLite Wartung[/bold]", box=box.ROUNDED))
     db_path = config["sqlite_path"]
-    choice = questionary.select("Aktion wählen:", choices=["VACUUM (Datei neu schreiben - braucht 2x Platz)", "Optimize (WAL Checkpoint + Analyze All)", "Analyze (Einzelne Tabellen)", "Integrity Check", "Zurück"]).ask()
-    if choice == "Zurück": return
+    choice = questionary.select("Aktion wählen:", choices=["VACUUM", "Optimize", "Analyze", "Integrity Check", "Zurück"]).ask()
+    if choice == "Zurück":
+        return
     s_conn = connect_sqlite_rw(db_path)
-    if not s_conn: return
+    if not s_conn:
+        return
     try:
         cur = s_conn.cursor()
-        if "VACUUM" in choice:
+        if choice == "VACUUM":
             if questionary.confirm(f"WARNUNG: VACUUM benötigt temporär den doppelten Speicherplatz der DB. Sicher?").ask():
-                with console.status("Führe VACUUM durch (Kann lange dauern!)..."): cur.execute("VACUUM;")
+                with console.status("Führe VACUUM durch (Kann lange dauern!)..."):
+                    cur.execute("VACUUM;")
                 console.print("[green]VACUUM erfolgreich.[/green]")
-        elif "Optimize" in choice:
-            with console.status("Führe WAL Checkpoint durch..."): cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-            with console.status("Führe ANALYZE (Full) durch..."): cur.execute("ANALYZE;")
+        elif choice == "Optimize":
+            with console.status("Führe WAL Checkpoint durch..."):
+                cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                cur.execute("ANALYZE;")
             console.print("[green]Optimierung fertig.[/green]")
-        elif "Analyze (Einzelne" in choice:
-            choices = [questionary.Choice(t['name']) for t in TABLES_CONF]
-            selected = questionary.checkbox("Tabellen wählen:", choices=choices).ask()
-            if selected:
+        elif choice == "Analyze":
+            sel = questionary.checkbox("Tabellen:", choices=[questionary.Choice(t['name']) for t in TABLES_CONF]).ask()
+            if sel: 
                 with Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(), TaskProgressColumn()) as progress:
-                    task = progress.add_task("Analyze...", total=len(selected))
-                    for t in selected:
+                    task = progress.add_task("Analyze...", total=len(sel))
+                    for t in sel: 
                         progress.update(task, description=f"Analyze {t}...")
-                        try: cur.execute(f"ANALYZE {t};")
-                        except Exception as e: console.print(f"[red]Fehler bei {t}: {e}[/red]")
+                        try:
+                            cur.execute(f"ANALYZE {t};")
+                        except Exception as e:
+                            console.print(f"[red]Fehler {t}: {e}[/red]")
                         progress.advance(task)
                 console.print("[green]Fertig.[/green]")
-        elif "Integrity" in choice:
-            with console.status("Prüfe Integrität..."): cur.execute("PRAGMA integrity_check;"); res = cur.fetchall()
+        elif choice == "Integrity Check":
+            with console.status("Prüfe Integrität..."):
+                cur.execute("PRAGMA integrity_check;")
+                res = cur.fetchall()
             for r in res:
-                if r[0] == "ok": console.print("[green]Integrität OK.[/green]")
-                else: console.print(f"[red]Fehler: {r[0]}[/red]")
-    except Exception as e: console.print(f"[red]Fehler bei SQLite Wartung: {e}[/red]")
-    finally: s_conn.close()
-    questionary.press_any_key_to_continue().ask()
-
-def action_truncate_menu(config):
-    console.print(Panel("[bold red]PostgreSQL Tabellen leeren (TRUNCATE)[/bold red]", box=box.ROUNDED))
-    console.print("[red]ACHTUNG: Dies löscht ALLE Daten in den gewählten Tabellen![/red]")
-    console.print("[red]HINWEIS: Wegen Abhängigkeiten (Foreign Keys) wird CASCADE verwendet.[/red]")
-    choices = []
-    s_conn = connect_sqlite_ro(config["sqlite_path"])
-    try: p_conn = psycopg2.connect(host=config["pg_host"], port=config["pg_port"], database=config["pg_db"], user=config["pg_user"], password=config["pg_pass"]); p_cur = p_conn.cursor()
-    except: p_conn = None; p_cur = None
-    if s_conn:
-        s_cur = s_conn.cursor()
-        with console.status("Lade aktuelle Tabellengrößen..."):
-            for tbl in TABLES_CONF:
-                name = tbl['name']; p_c = "n/a"
-                if p_cur:
-                    try: p_cur.execute(f"SELECT COUNT(*) FROM public.{name}"); p_c = f"{p_cur.fetchone()[0]:,}"
-                    except: pass
-                s_c = "n/a"
-                try: s_cur.execute(f"SELECT COUNT(*) FROM {name}"); s_c = f"{s_cur.fetchone()[0]:,}"
-                except: pass
-                label = f"{name:<25} │ PG: {p_c:>10} │ SQ: {s_c:>10}"
-                choices.append(questionary.Choice(label, value=name))
+                if r[0] == "ok":
+                    console.print("[green]Integrität OK.[/green]")
+                else:
+                    console.print(f"[red]Fehler: {r[0]}[/red]")
+    except Exception as e:
+        console.print(f"[red]Fehler bei SQLite Wartung: {e}[/red]")
+    finally:
         s_conn.close()
-    if p_conn: p_conn.close()
-    if not choices: choices = [questionary.Choice(t['name']) for t in TABLES_CONF]
-    console.print(f"   {'Tabelle':<25} │ {'Postgres':>10}   │ {'SQLite':>10}")
-    console.print(f" {'─'*27}┼{'─'*14}┼{'─'*13}")
-    targets = questionary.checkbox("Welche Tabellen leeren?", choices=choices).ask()
-    if not targets: return
-    if not questionary.confirm(f"Wirklich {len(targets)} Tabellen unwiderruflich leeren?", default=False).ask(): return
-    with PostgresManager(config, fast_mode=False) as p_conn:
-        cur = p_conn.cursor()
-        try:
-            table_list = ", ".join([f"public.{t}" for t in targets])
-            console.print(f"[yellow]Führe TRUNCATE {table_list} CASCADE aus...[/yellow]")
-            cur.execute(f"TRUNCATE TABLE {table_list} CASCADE;")
-            p_conn.commit(); console.print("[green]Tabellen erfolgreich geleert.[/green]")
-            data = load_json(PROGRESS_FILE); reset_count = 0
-            for t in targets:
-                if t in data: del data[t]; reset_count += 1
-            if reset_count > 0: save_json(PROGRESS_FILE, data); console.print(f"[green]Fortschritt für {reset_count} Tabellen zurückgesetzt.[/green]")
-        except Exception as e: p_conn.rollback(); console.print(f"[bold red]Fehler beim Leeren: {e}[/bold red]")
     questionary.press_any_key_to_continue().ask()
 
 def action_maintenance(config):
-    choice = questionary.select("Wartungsoption wählen:", choices=["Sequenzen Reset (Pre-Flight)", "SQLite Optimierung & Check", "Postgres Tabellen leeren (TRUNCATE)", "DB Status Check", "Postgres VACUUM", "Fortschritt zurücksetzen", "Zurück"]).ask()
-    if choice.startswith("Sequenzen"): action_sequence_reset(config)
-    elif choice.startswith("DB Status"): action_show_stats(config)
-    elif choice.startswith("Fortschritt"): action_reset_progress()
-    elif choice.startswith("Postgres VACUUM"): action_vacuum_menu(config)
-    elif choice.startswith("SQLite"): action_sqlite_maintenance(config)
-    elif choice.startswith("Postgres Tabellen"): action_truncate_menu(config)
+    while True:
+        choice = questionary.select("Option:", choices=["Sequenzen Reset", "Repair Center (Smart)", "DB Status", "Postgres VACUUM", "Postgres TRUNCATE", "SQLite Wartung", "Reset Progress", "Zurück"]).ask()
+        if choice == "Zurück":
+            return
+        if choice == "Sequenzen Reset":
+            action_sequence_reset(config)
+        if choice == "Repair Center (Smart)":
+            action_fix_metadata(config)
+        if choice == "DB Status":
+            action_show_stats(config)
+        if choice == "Postgres VACUUM":
+            action_vacuum_menu(config)
+        if choice == "Postgres TRUNCATE":
+            action_truncate_menu(config)
+        if choice == "SQLite Wartung":
+            action_sqlite_maintenance(config)
+        if choice == "Reset Progress":
+            action_reset_progress()
+
+def action_migration_menu(config):
+    choice = questionary.select("Modus:", choices=["Alle Tabellen", "Selektiv", "Zurück"]).ask()
+    if choice == "Zurück":
+        return
+    plan = [t['name'] for t in TABLES_CONF] if choice.startswith("Alle") else questionary.checkbox("Wähle Tabellen:", choices=[questionary.Choice(t['name']) for t in TABLES_CONF]).ask()
+    if plan:
+        run_migration_plan(config, plan)
 
 def main():
     console.clear()
-    console.print(Panel.fit("[bold blue]Home Assistant Migration Tool[/bold blue]\n[dim]Next-Gen Edition (v35 - Safety First)[/dim]", box=box.DOUBLE))
+    console.print(Panel.fit("[bold blue]Home Assistant Migration Tool[/bold blue]\n[dim]v68 - Final Production Release[/dim]", box=box.DOUBLE))
     if not os.path.exists(CONFIG_FILE):
-        if questionary.confirm("Keine Konfiguration gefunden. Jetzt erstellen?").ask(): action_create_config()
-        else: return
-    try: with open(CONFIG_FILE) as f: config = json.load(f)
-    except: console.print("[red]Konfiguration defekt.[/red]"); return
+        action_create_config()
+    config = load_json(CONFIG_FILE)
+    if not config:
+        return
+    
     while True:
         console.print("")
-        choice = questionary.select("Hauptmenü", choices=["Migration starten", "Wartung & Diagnose", "TimescaleDB Optimierung", "Konfiguration bearbeiten", "Beenden"]).ask()
-        if choice == "Beenden": sys.exit(0)
-        elif choice == "Konfiguration bearbeiten": action_create_config()
-        elif choice == "Wartung & Diagnose": action_maintenance(config)
-        elif choice == "TimescaleDB Optimierung": action_convert_schema(config)
-        elif choice == "Migration starten": action_migration_menu(config)
+        c = questionary.select("Hauptmenü", choices=["Migration starten", "Wartung & Diagnose", "TimescaleDB Optimierung", "Config", "Beenden"]).ask()
+        if c == "Beenden":
+            sys.exit(0)
+        if c == "Config":
+            config = action_create_config()
+        if c == "Migration starten":
+            action_migration_menu(config)
+        if c == "TimescaleDB Optimierung":
+            action_convert_schema(config)
+        if c == "Wartung & Diagnose":
+            action_maintenance(config)
 
 if __name__ == "__main__":
-    try: main()
-    except KeyboardInterrupt: console.print("\n[yellow]Beendet durch Benutzer.[/yellow]")
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Abbruch.[/yellow]")
