@@ -1,6 +1,6 @@
 """
 Home Assistant Migration Tool (SQLite to PostgreSQL)
-Version: 70 (Production Grade + Repair Visualizer + Config Editor)
+Version: 71 (Production Grade + DSN Support + Dry Run + Auto Backup)
 Author: Gemini (AI)
 License: MIT
 
@@ -12,41 +12,44 @@ KEY FEATURES:
 1. Global Layering: Migrates metadata first to satisfy Foreign Keys.
 2. Fast Mode: Temporarily disables constraints for speed (if possible).
 3. Live-Start: Sets sequences early so HA can run during history import.
-4. Smart Repair: 
-   - Fixes 'Ghost Data' (ID reassignment).
-   - VISUALIZATION: Draws ASCII timelines to show data overlaps/gaps before merging.
+4. Smart Repair: Dual-Mode repair center for SQLite and Postgres.
 5. Auto-Healing: Adaptive Batch Size reduces automatically on connection drops.
-6. Verification: Post-migration audit comparing row counts.
+6. Safety: Auto-Backups for SQLite and Dry-Run mode for repairs.
+7. Connectivity: Supports full PostgreSQL DSN strings (SSL).
 """
 
-import sqlite3
-import psycopg2
-import psycopg2.extras
-from psycopg2.extras import execute_values
-from dateutil import parser as date_parser
-from datetime import datetime, timezone
 import sys
 import os
-import json
+import shutil
 import time
+import json
 import re
 import math
+from datetime import datetime, timezone
 
-# UI Libraries
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from rich.progress import (
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    BarColumn,
-    TaskProgressColumn,
-    TimeRemainingColumn
-)
-from rich import box
-import questionary
-from questionary import Choice
+# --- DEPENDENCY PRE-FLIGHT CHECK ---
+try:
+    import sqlite3
+    import psycopg2
+    import psycopg2.extras
+    from psycopg2.extras import execute_values
+    from dateutil import parser as date_parser
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.progress import (
+        Progress, SpinnerColumn, TextColumn, BarColumn, 
+        TaskProgressColumn, TimeRemainingColumn
+    )
+    from rich import box
+    import questionary
+    from questionary import Choice
+except ImportError as e:
+    print("\n[FATAL ERROR] Fehlende Abhängigkeiten!")
+    print(f"Details: {e}")
+    print("Bitte installieren Sie die Anforderungen:")
+    print("  pip install -r requirements.txt\n")
+    sys.exit(1)
 
 # ==============================================================================
 # CONFIGURATION & CONSTANTS
@@ -54,11 +57,13 @@ from questionary import Choice
 
 DEFAULT_CONFIG = {
     "sqlite_path": "home-assistant_v2.db",
+    "pg_mode": "params",  # 'params' or 'dsn'
     "pg_host": "localhost",
     "pg_port": "5432",
     "pg_db": "homeassistant",
     "pg_user": "homeassistant",
     "pg_pass": "",
+    "pg_dsn": "",
     "batch_size": 10000,
     "seq_buffer": 50000,
     "timescale_enabled": False
@@ -143,6 +148,9 @@ def condense_ids_to_ranges(id_list):
         return [str(x) for x in id_list]
     
     ranges = []
+    if not sorted_ids:
+        return ranges
+
     range_start = sorted_ids[0]
     prev_id = sorted_ids[0]
     
@@ -255,7 +263,7 @@ def sqlite_regexp(expr, item):
         return False
 
 class PostgresManager:
-    """Context manager for Postgres with Keepalive and Fast-Mode support."""
+    """Context manager handling both Parameter and DSN connections."""
     def __init__(self, config, fast_mode=True):
         self.cfg = config
         self.fast_mode = fast_mode
@@ -264,19 +272,32 @@ class PostgresManager:
 
     def __enter__(self):
         try:
-            self.conn = psycopg2.connect(
-                host=self.cfg["pg_host"],
-                port=self.cfg["pg_port"],
-                database=self.cfg["pg_db"],
-                user=self.cfg["pg_user"],
-                password=self.cfg["pg_pass"],
-                application_name="ha_migrator_v70",
-                connect_timeout=10,
-                keepalives=1,
-                keepalives_idle=30,
-                keepalives_interval=10,
-                keepalives_count=5
-            )
+            # Check Connection Mode (DSN vs Params)
+            if self.cfg.get("pg_mode") == "dsn" and self.cfg.get("pg_dsn"):
+                self.conn = psycopg2.connect(
+                    dsn=self.cfg["pg_dsn"],
+                    application_name="ha_migrator_v71",
+                    connect_timeout=10,
+                    keepalives=1,
+                    keepalives_idle=30,
+                    keepalives_interval=10,
+                    keepalives_count=5
+                )
+            else:
+                self.conn = psycopg2.connect(
+                    host=self.cfg["pg_host"],
+                    port=self.cfg["pg_port"],
+                    database=self.cfg["pg_db"],
+                    user=self.cfg["pg_user"],
+                    password=self.cfg["pg_pass"],
+                    application_name="ha_migrator_v71",
+                    connect_timeout=10,
+                    keepalives=1,
+                    keepalives_idle=30,
+                    keepalives_interval=10,
+                    keepalives_count=5
+                )
+
             with self.conn.cursor() as cur:
                 cur.execute("SET TIME ZONE 'UTC';")
                 if self.fast_mode:
@@ -321,15 +342,28 @@ def connect_sqlite_ro(path):
         conn.row_factory = sqlite3.Row
         return conn
     except:
+        # Fallback for systems not supporting URI
         conn = sqlite3.connect(path, timeout=300)
         conn.row_factory = sqlite3.Row
         return conn
 
 def connect_sqlite_rw(path):
-    """Connect to SQLite in Read-Write mode (Maintenance)."""
+    """Connect to SQLite in Read-Write mode with Auto-Backup."""
     if not os.path.exists(path):
         console.print(f"[bold red]FATAL: SQLite Datei fehlt:[/bold red] {path}")
         return None
+    
+    # Auto-Backup Safety
+    backup_path = path + ".bak"
+    if not os.path.exists(backup_path):
+        try:
+            with console.status(f"Erstelle Sicherheits-Backup ({backup_path})..."):
+                shutil.copy2(path, backup_path)
+            console.print(f"[green]✓ SQLite Backup erstellt: {backup_path}[/green]")
+        except Exception as e:
+            console.print(f"[red]WARNUNG: Backup fehlgeschlagen ({e}). Fortfahren auf eigenes Risiko![/red]")
+            time.sleep(2)
+
     try:
         conn = sqlite3.connect(path, timeout=600)
         # Register REGEXP for repair functions
@@ -851,6 +885,7 @@ def run_migration_plan(config, plan):
             title="Ready for Live-Start", box=box.DOUBLE, style="green"
         ))
         
+        # Explicit Sequence Update for Phase 2 tables BEFORE allowing HA start
         with console.status("Bereite Live-Start vor (Sequenzen update)..."):
             with PostgresManager(config, fast_mode=False) as p_conn:
                 p_cur = p_conn.cursor()
@@ -954,8 +989,6 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
                 HAVING count(*) > 1;
             """
         elif repair_type == "suffixes":
-            # SQLite Regexp: Note the different string concat syntax and no jsonb
-            # FIX: Use raw string r"""...""" to avoid Python SyntaxWarning on '\.'
             search_sql = r"""
                 SELECT 
                     m1.statistic_id, 
@@ -988,33 +1021,30 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
             for row in candidates:
                 if merge_mode:
                     if db_type == "postgres":
-                        # Postgres returns list directly due to jsonb_agg
                         if len(row) == 2:
                             name = row[0]
                             ids = row[1]
                         else: continue
                     else:
-                        # SQLite returns JSON string "[1, 2]"
                         name = row[0]
                         try:
                             ids = json.loads(row[1])
                         except:
                             continue
 
-                    # Dedup IDs
                     ids = sorted(list(set(ids)))
 
                     stats = []
                     for eid in ids:
                         try:
-                            # Query works for both DBs (mostly standard SQL)
-                            cur.execute("SELECT COUNT(*), MIN(start_ts), MAX(start_ts) FROM statistics WHERE metadata_id = %s" if db_type == 'postgres' else "SELECT COUNT(*), MIN(start_ts), MAX(start_ts) FROM statistics WHERE metadata_id = ?", (eid,))
+                            q_lts = "SELECT COUNT(*), MIN(start_ts), MAX(start_ts) FROM statistics WHERE metadata_id = %s" if db_type == 'postgres' else "SELECT COUNT(*), MIN(start_ts), MAX(start_ts) FROM statistics WHERE metadata_id = ?"
+                            cur.execute(q_lts, (eid,))
                             res_lts = cur.fetchone()
                             
-                            cur.execute("SELECT COUNT(*) FROM statistics_short_term WHERE metadata_id = %s" if db_type == 'postgres' else "SELECT COUNT(*) FROM statistics_short_term WHERE metadata_id = ?", (eid,))
+                            q_st = "SELECT COUNT(*) FROM statistics_short_term WHERE metadata_id = %s" if db_type == 'postgres' else "SELECT COUNT(*) FROM statistics_short_term WHERE metadata_id = ?"
+                            cur.execute(q_st, (eid,))
                             cnt_st = cur.fetchone()[0]
                             
-                            # Handle None results
                             rows = (res_lts[0] or 0) + (cnt_st or 0)
                             min_ts = res_lts[1]
                             max_ts = res_lts[2] or 0
@@ -1028,7 +1058,6 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
                         except Exception:
                             stats.append({"id": eid, "rows": 0, "min_ts": 0, "max_ts": 0})
                     
-                    # Sort: latest timestamp wins
                     stats.sort(key=lambda x: x["max_ts"], reverse=True)
                     
                     if not stats: continue
@@ -1043,21 +1072,21 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
                         "source_ids": source_ids,
                         "target_stats": f"ID {target['id']}: {target['rows']} Zeilen ({format_ts(target['min_ts'])} - {format_ts(target['max_ts'])})",
                         "source_stats": "\n".join([f"ID {s['id']}: {s['rows']} Zeilen ({format_ts(s['min_ts'])} - {format_ts(s['max_ts'])})" for s in sources]),
-                        "all_stats": stats # Pass for visualization
+                        "all_stats": stats
                     })
 
-        # Render Table with Visualization
+        # Render Table
         table = Table(title=f"Gefundene Konflikte: {len(conflicts)}", show_lines=True)
         table.add_column("Sensor", style="cyan")
         table.add_column("Merge", style="bold magenta")
         table.add_column("Zeitraum & Details", style="green")
         
         for c in conflicts:
-            timeline_chart = generate_ascii_timeline(c['all_stats'])
+            timeline = generate_ascii_timeline(c['all_stats'])
             table.add_row(
                 c["name"],
                 f"{c['source_ids']} -> {c['target_id']}",
-                timeline_chart
+                timeline
             )
         console.print(table)
         
@@ -1076,6 +1105,7 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
                     "Aktion:",
                     choices=[
                         Choice("Merge durchführen", value="merge"),
+                        Choice("Simulation (Dry Run)", value="dry_run"),
                         Choice("Ziel-ID ändern", value="edit"),
                         Choice("Skip", value="skip")
                     ]
@@ -1093,20 +1123,32 @@ def analyze_and_fix_interactive(config, title, merge_mode=True, repair_type="dup
                     target_id = int(questionary.text("Neue Ziel-ID:", default=str(target_id)).ask())
                 
                 try:
-                    # Execute Merge
-                    # Syntax differs significantly for array/list params
-                    
+                    # Feature: Dry Run
                     if db_type == "postgres":
+                        if action == "dry_run":
+                            console.print(f"[dim]SQL (Postgres):[/dim]")
+                            console.print(f"UPDATE statistics SET metadata_id = {target_id} WHERE metadata_id = ANY(ARRAY{c['source_ids']});")
+                            console.print(f"UPDATE statistics_short_term SET metadata_id = {target_id} WHERE metadata_id = ANY(ARRAY{c['source_ids']});")
+                            console.print(f"DELETE FROM statistics_meta WHERE id = ANY(ARRAY{c['source_ids']});")
+                            input("Drücke Enter für weiter...")
+                            continue
+
                         cur.execute(f"UPDATE statistics SET metadata_id = {target_id} WHERE metadata_id = ANY(%s)", (c['source_ids'],))
                         cur.execute(f"UPDATE statistics_short_term SET metadata_id = {target_id} WHERE metadata_id = ANY(%s)", (c['source_ids'],))
                         cur.execute(f"DELETE FROM statistics_meta WHERE id = ANY(%s)", (c['source_ids'],))
-                    else: # SQLite (No ANY(), use IN (?,?,?))
-                        # Helper for placeholders
-                        placeholders = ','.join('?' * len(c['source_ids']))
-                        
-                        cur.execute(f"UPDATE statistics SET metadata_id = ? WHERE metadata_id IN ({placeholders})", [target_id] + c['source_ids'])
-                        cur.execute(f"UPDATE statistics_short_term SET metadata_id = ? WHERE metadata_id IN ({placeholders})", [target_id] + c['source_ids'])
-                        cur.execute(f"DELETE FROM statistics_meta WHERE id IN ({placeholders})", c['source_ids'])
+                    else: # SQLite
+                        ph = ','.join('?' * len(c['source_ids']))
+                        if action == "dry_run":
+                            console.print(f"[dim]SQL (SQLite):[/dim]")
+                            console.print(f"UPDATE statistics SET metadata_id = {target_id} WHERE metadata_id IN ({','.join(map(str, c['source_ids']))});")
+                            console.print(f"UPDATE statistics_short_term SET metadata_id = {target_id} WHERE metadata_id IN ({','.join(map(str, c['source_ids']))});")
+                            console.print(f"DELETE FROM statistics_meta WHERE id IN ({','.join(map(str, c['source_ids']))});")
+                            input("Drücke Enter für weiter...")
+                            continue
+
+                        cur.execute(f"UPDATE statistics SET metadata_id = ? WHERE metadata_id IN ({ph})", [target_id] + c['source_ids'])
+                        cur.execute(f"UPDATE statistics_short_term SET metadata_id = ? WHERE metadata_id IN ({ph})", [target_id] + c['source_ids'])
+                        cur.execute(f"DELETE FROM statistics_meta WHERE id IN ({ph})", c['source_ids'])
 
                     conn.commit()
                     console.print(f"[green]✓ {c['name']} gemerged.[/green]")
@@ -1217,16 +1259,18 @@ def action_edit_config():
     """Allows user to edit the config.json via menu."""
     config = load_json(CONFIG_FILE) or DEFAULT_CONFIG.copy()
     
-    choices = [
-        Choice(f"SQLite Pfad: {config.get('sqlite_path')}", value="sqlite_path"),
-        Choice(f"PG Host: {config.get('pg_host')}", value="pg_host"),
-        Choice(f"PG User: {config.get('pg_user')}", value="pg_user"),
-        Choice(f"PG Pass: ***", value="pg_pass"),
-        Choice(f"Batch Size: {config.get('batch_size')}", value="batch_size"),
-        "Speichern & Zurück"
-    ]
-    
     while True:
+        choices = [
+            Choice(f"SQLite Pfad: {config.get('sqlite_path')}", value="sqlite_path"),
+            Choice(f"PG Modus: {config.get('pg_mode', 'params')}", value="pg_mode"),
+            Choice(f"PG Host: {config.get('pg_host')}", value="pg_host"),
+            Choice(f"PG User: {config.get('pg_user')}", value="pg_user"),
+            Choice(f"PG Pass: ***", value="pg_pass"),
+            Choice(f"PG DSN: {str(config.get('pg_dsn'))[:20]}...", value="pg_dsn"),
+            Choice(f"Batch Size: {config.get('batch_size')}", value="batch_size"),
+            "Speichern & Zurück"
+        ]
+        
         key = questionary.select("Einstellung bearbeiten:", choices=choices).ask()
         if key == "Speichern & Zurück":
             save_json(CONFIG_FILE, config)
@@ -1234,6 +1278,8 @@ def action_edit_config():
         
         if key == "pg_pass":
             val = questionary.password("Neues Passwort:").ask()
+        elif key == "pg_mode":
+            val = questionary.select("Verbindungsmodus:", choices=["params", "dsn"]).ask()
         else:
             val = questionary.text(f"Neuer Wert für {key}:", default=str(config.get(key, ""))).ask()
             if key == "batch_size":
@@ -1241,15 +1287,6 @@ def action_edit_config():
                 except: val = 10000
         
         config[key] = val
-        # Refresh choices to show new values
-        choices = [
-            Choice(f"SQLite Pfad: {config.get('sqlite_path')}", value="sqlite_path"),
-            Choice(f"PG Host: {config.get('pg_host')}", value="pg_host"),
-            Choice(f"PG User: {config.get('pg_user')}", value="pg_user"),
-            Choice(f"PG Pass: ***", value="pg_pass"),
-            Choice(f"Batch Size: {config.get('batch_size')}", value="batch_size"),
-            "Speichern & Zurück"
-        ]
 
 def action_verify_migration(config):
     """Checks row counts between SQLite and Postgres."""
@@ -1302,14 +1339,28 @@ def action_create_config():
     current = load_json(CONFIG_FILE) or DEFAULT_CONFIG.copy()
     config = {}
     config['sqlite_path'] = questionary.path("Pfad zur SQLite Datei:", default=current.get('sqlite_path')).ask()
-    config['pg_host'] = questionary.text("Postgres Host:", default=current.get('pg_host')).ask()
-    config['pg_port'] = questionary.text("Postgres Port:", default=current.get('pg_port')).ask()
-    config['pg_db'] = questionary.text("DB Name:", default=current.get('pg_db')).ask()
-    config['pg_user'] = questionary.text("User:", default=current.get('pg_user')).ask()
-    config['pg_pass'] = questionary.password("Passwort:", default=current.get('pg_pass')).ask()
+    config['pg_mode'] = questionary.select("Verbindungsmodus:", choices=["params", "dsn"], default=current.get('pg_mode', 'params')).ask()
+    
+    if config['pg_mode'] == 'dsn':
+        config['pg_dsn'] = questionary.text("Postgres DSN (Connection String):", default=current.get('pg_dsn', '')).ask()
+        # Set defaults for others to avoid key errors
+        config['pg_host'] = "localhost"
+        config['pg_port'] = "5432"
+        config['pg_db'] = "homeassistant"
+        config['pg_user'] = "user"
+        config['pg_pass'] = ""
+    else:
+        config['pg_host'] = questionary.text("Postgres Host:", default=current.get('pg_host')).ask()
+        config['pg_port'] = questionary.text("Postgres Port:", default=current.get('pg_port')).ask()
+        config['pg_db'] = questionary.text("DB Name:", default=current.get('pg_db')).ask()
+        config['pg_user'] = questionary.text("User:", default=current.get('pg_user')).ask()
+        config['pg_pass'] = questionary.password("Passwort:", default=current.get('pg_pass')).ask()
+        config['pg_dsn'] = ""
+
     config['batch_size'] = int(questionary.text("Batch Size:", default=str(current.get('batch_size'))).ask())
     config['seq_buffer'] = int(questionary.text("Sequenz Puffer:", default=str(current.get('seq_buffer'))).ask())
     config['timescale_enabled'] = questionary.confirm("TimescaleDB nutzen?", default=current.get('timescale_enabled')).ask()
+    
     save_json(CONFIG_FILE, config)
     console.print(f"[green]Konfiguration gespeichert in {CONFIG_FILE}[/green]")
     questionary.press_any_key_to_continue().ask()
@@ -1341,8 +1392,7 @@ def action_sequence_reset(config):
     """Manually resets PostgreSQL sequences."""
     console.print(Panel("[bold]Pre-Flight Check: Sequenzen[/bold]", box=box.ROUNDED))
     s_conn = connect_sqlite_ro(config["sqlite_path"])
-    if not s_conn:
-        return
+    if not s_conn: return
     with console.status("[bold green]Verbinde mit Postgres...") as status:
         with PostgresManager(config, fast_mode=False) as p_conn:
             p_cur = p_conn.cursor()
@@ -1352,8 +1402,7 @@ def action_sequence_reset(config):
             for tbl in TABLES_CONF:
                 name = tbl['name']
                 pk = tbl.get('pk')
-                if not pk:
-                    continue
+                if not pk: continue
                 max_sqlite = get_max_id(s_conn.cursor(), name, pk)
                 updated, curr, target = update_sequence_if_needed(p_cur, name, pk, max_sqlite, config['seq_buffer'])
                 table.add_row(name, f"UPDATE: {curr} -> {target}" if updated else f"OK ({curr} > {target})")
@@ -1408,7 +1457,6 @@ def action_convert_schema(config):
     questionary.press_any_key_to_continue().ask()
 
 def action_show_stats(config):
-    """Checks the row counts in both databases."""
     action_verify_migration(config)
 
 def action_vacuum_menu(config):
@@ -1534,7 +1582,7 @@ def action_migration_menu(config):
 
 def main():
     console.clear()
-    console.print(Panel.fit("[bold blue]Home Assistant Migration Tool[/bold blue]\n[dim]v70 - Final Production Release[/dim]", box=box.DOUBLE))
+    console.print(Panel.fit("[bold blue]Home Assistant Migration Tool[/bold blue]\n[dim]v71 - Final Production Release[/dim]", box=box.DOUBLE))
     if not os.path.exists(CONFIG_FILE):
         action_create_config()
     config = load_json(CONFIG_FILE)
